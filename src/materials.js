@@ -107,10 +107,11 @@ export function loadPhotoTextures() {
   const sets = ['path', 'grassrock', 'rock', 'masonry'];
   return Promise.all(
     sets.map(async (name) => {
+      const detailOnly = name === 'masonry'; // diffuse-only detail layer
       const [map, nor, arm] = await Promise.all([
         one(name + '_diff.jpg', true),
-        one(name + '_nor.jpg', false),
-        one(name + '_arm.jpg', false),
+        detailOnly ? null : one(name + '_nor.jpg', false),
+        detailOnly ? null : one(name + '_arm.jpg', false),
       ]);
       photo[name] = { map, nor, arm };
       if (map && map.image) photoImages[name] = map.image;

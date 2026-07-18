@@ -1,0 +1,10 @@
+Bundled 3D models: photogrammetry glTF assets from Poly Haven
+(https://polyhaven.com), all licensed CC0 1.0 Universal (public domain,
+no attribution required). Downloaded 2026-07-18, 1k-texture glTF variants,
+folder structure preserved per model.
+
+- moon_rock_02/       https://polyhaven.com/a/moon_rock_02
+- moon_rock_06/       https://polyhaven.com/a/moon_rock_06
+- rock_07/            https://polyhaven.com/a/rock_07
+- dead_quiver_trunk/  https://polyhaven.com/a/dead_quiver_trunk
+- shrub_02/           https://polyhaven.com/a/shrub_02

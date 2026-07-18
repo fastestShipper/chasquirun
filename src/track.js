@@ -20,6 +20,7 @@ import {
 } from './scenery.js';
 import { buildLlama, buildAlpaca } from './animals.js';
 import { CoinField, Specials } from './collectibles.js';
+import { makeSplatMaterial, makeTerrainGeometry } from './terrain.js';
 
 const L = CONFIG.chunkLen;
 const AHEAD_CHUNKS = 11;
@@ -150,6 +151,15 @@ export class Track {
     this._built = true;
   }
 
+  // Scale a BoxGeometry's UVs so a texture tiles every ~`tile` meters.
+  _tileUV(geo, w, h, tile = 4) {
+    const uv = geo.attributes.uv;
+    for (let i = 0; i < uv.count; i++) {
+      uv.setXY(i, uv.getX(i) * (w / tile), uv.getY(i) * (h / tile));
+    }
+    return geo;
+  }
+
   _ground(w, d, mat, x = 0, y = -0.15, z = -L / 2) {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.3, d), mat);
     m.position.set(x, y, z);
@@ -175,6 +185,32 @@ export class Track {
   // opts.shape(worldX, chunkLocalZ) may add extra height (banks, lake beds).
   _terrain(w, d, baseMat, x, z = -L / 2, opts = {}) {
     const amp = opts.amp === undefined ? 0.55 : opts.amp;
+    if (opts.splat) {
+      // Splat-mapped terrain: photo layers blended by slope + noise in the
+      // shader; same displacement field as the classic path below.
+      const s1 = this.rnd() * 10, s2 = this.rnd() * 10, s3 = this.rnd() * 10;
+      const geo = makeTerrainGeometry({
+        width: w, depth: d,
+        segsW: Math.max(4, Math.round(w / 1.6)),
+        segsD: Math.max(8, Math.round(d / 1.8)),
+        height: (lx, lz) => {
+          const wx = lx + x;
+          const flat = smoothstep(4.1, 7.5, Math.abs(wx));
+          let h =
+            (Math.sin(wx * 0.16 + s1) * Math.sin(lz * 0.13 + s2) * 0.6 +
+              Math.sin(wx * 0.43 + s3) * Math.sin(lz * 0.37 + s1) * 0.28 +
+              Math.sin(wx * 1.05 + s2) * Math.sin(lz * 0.92 + s3) * 0.12) * amp * flat;
+          if (opts.shape) h += opts.shape(wx, lz + z);
+          return h;
+        },
+        dirtMask: () => 0,
+      });
+      const m = new THREE.Mesh(geo, makeSplatMaterial());
+      m.position.set(x, opts.y === undefined ? -0.02 : opts.y, z);
+      m.matrixAutoUpdate = false;
+      m.updateMatrix();
+      return m;
+    }
     const geo = new THREE.PlaneGeometry(w, d, Math.max(4, Math.round(w / 1.6)), Math.max(8, Math.round(d / 1.8)));
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position;
@@ -294,8 +330,9 @@ export class Track {
     if (biome === 'VALLEY') {
       this._pathStrip(chunk, gap);
       // Rolling grass shoulders; the left one slopes down into the river.
-      group.add(this._terrain(9, L, Mats.grass(), 8.4));
+      group.add(this._terrain(9, L, Mats.grass(), 8.4, -L / 2, { splat: true }));
       group.add(this._terrain(5.4, L, Mats.grass(), -6.4, -L / 2, {
+        splat: true,
         shape: (wx) => -0.62 * smoothstep(7.9, 8.9, -wx),
       }));
       // River to the left, far bank beyond (sloping up out of the water).
@@ -303,7 +340,7 @@ export class Track {
       river.position.set(-13.4, -0.55, -L / 2);
       group.add(river);
       group.add(this._terrain(10, L, Mats.grass(), -22.9, -L / 2, {
-        amp: 0.8,
+        splat: true, amp: 0.8,
         shape: (wx) => -0.62 * smoothstep(-18.8, -17.9, wx),
       }));
       const reeds = buildReeds({ count: 8, area: [2.5, L - 6] });
@@ -376,16 +413,16 @@ export class Track {
       // sheer drop right into a valley far below.
       this._pathStrip(chunk, gap);
       // Narrow shoulder between path and wall.
-      group.add(this._terrain(3.2, L, Mats.grass(), -5.4, -L / 2, { amp: 0.2 }));
+      group.add(this._terrain(3.2, L, Mats.grass(), -5.4, -L / 2, { splat: true, amp: 0.2 }));
       // The cliff wall: two stepped rock faces leaning over the road.
-      const wall1 = new THREE.Mesh(new THREE.BoxGeometry(9, 30, L + 0.4), Mats.stoneDark());
+      const wall1 = new THREE.Mesh(this._tileUV(new THREE.BoxGeometry(9, 30, L + 0.4), L, 30, 5), Mats.stoneDark());
       wall1.position.set(-11.4, 13.5, -L / 2);
       wall1.rotation.z = -0.06;
       wall1.castShadow = true;
       wall1.matrixAutoUpdate = false;
       wall1.updateMatrix();
       group.add(wall1);
-      const wall2 = new THREE.Mesh(new THREE.BoxGeometry(10, 44, L + 0.4), Mats.stoneDark());
+      const wall2 = new THREE.Mesh(this._tileUV(new THREE.BoxGeometry(10, 44, L + 0.4), L, 44, 6), Mats.stoneDark());
       wall2.position.set(-18.5, 18, -L / 2);
       wall2.matrixAutoUpdate = false;
       wall2.updateMatrix();
@@ -394,7 +431,7 @@ export class Track {
       tufts.position.set(-5.6, 0, -L / 2);
       group.add(tufts);
       // Narrow rim, then the abyss: crumbling stones mark the edge.
-      group.add(this._terrain(2.8, L, Mats.grass(), 5.2, -L / 2, { amp: 0.1 }));
+      group.add(this._terrain(2.8, L, Mats.grass(), 5.2, -L / 2, { splat: true, amp: 0.1 }));
       for (let z = -2; z > -L; z -= 5.5) {
         if (rnd() < 0.35) continue;
         const rs = buildBoulder(0.24 + rnd() * 0.22);
@@ -406,14 +443,14 @@ export class Track {
       }
       // The mountainside continues BELOW the ledge: falling shows rock all
       // the way down, never bare sky.
-      const face = new THREE.Mesh(new THREE.BoxGeometry(16, 34, L + 0.4), Mats.stoneDark());
+      const face = new THREE.Mesh(this._tileUV(new THREE.BoxGeometry(16, 34, L + 0.4), L, 34, 5), Mats.stoneDark());
       face.position.set(-2.5, -17.2, -L / 2);
       face.matrixAutoUpdate = false;
       face.updateMatrix();
       group.add(face);
       // The valley floor far below, reaching from the cliff base outward.
       group.add(this._terrain(46, L, Mats.grass(), 26, -L / 2, {
-        amp: 1.4, y: -34,
+        splat: true, amp: 1.4, y: -34,
         shape: (wx) => (wx > 19 && wx < 29 ? -1.7 * (1 - Math.abs(wx - 24) / 5) : 0),
       }));
       const deepRiver = this.water.makeRiver({ width: 8, length: L + 2 });
@@ -496,7 +533,7 @@ export class Track {
       group.add(sides);
       // Gorge walls and the river far below.
       for (const side of [-1, 1]) {
-        const wall = new THREE.Mesh(new THREE.BoxGeometry(14, 34, L + 0.5), Mats.stoneDark());
+        const wall = new THREE.Mesh(this._tileUV(new THREE.BoxGeometry(14, 34, L + 0.5), L, 34, 5), Mats.stoneDark());
         wall.position.set(side * 14.5, -17.5, -L / 2);
         wall.rotation.z = side * -0.12;
         wall.matrixAutoUpdate = false;

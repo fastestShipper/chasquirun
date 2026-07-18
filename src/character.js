@@ -2,17 +2,22 @@
 // API (ARCHITECTURE.md): buildChasqui() -> { group, update(dt, state), setMode(mode), onFootstep(cb), dispose() }
 // state: { mode: 'idle'|'run'|'jump'|'slide'|'fall'|'menu', speed01, airT, leanX, dead }
 // Group origin at feet, character faces -Z. Zero allocations inside update().
-// Sculpt pass: capsule limbs with sphere joints, lathe torso, lathe/half-cone
-// poncho cloth with a wavy hem, rounded sandals. Skeleton pivots unchanged
-// (hip 0.62, knee 0.38, foot 0.12, shoulder ~1.04 world) so the original
-// animation system drives the new body without edits.
-// Clothing pass (anti-Pinocchio): knee/elbow/wrist/ankle joints are embedded
-// in equal-radius capsule chains (joint sphere radius == both adjacent
-// capsule radii, caps centered ON the joint pivots, so limbs read as one
-// smooth tube at any bend). An unku skirt (front/back waist-hinged flaps
-// with side slits) covers the hips to just above the knees and rides the
-// forward/rear thigh in update(); flared short sleeves on the upper arm
-// bones swallow shoulder + elbow; tall ojota strap cuffs dress the ankles.
+//
+// Guineo 2.0 (skinned body): the segmented capsule limbs are replaced by ONE
+// continuous THREE.SkinnedMesh (torso + arms + legs in a single low-poly
+// BufferGeometry, ~1600 verts) driven by a real THREE.Bone hierarchy at the
+// exact pivots of the old rig (hips 0.62, knees 0.38, feet 0.12, shoulders
+// ~1.04 world). Limbs are capsule-ish ring-loop tubes; every vertex carries a
+// 2-bone skin blend with soft falloff across the elbow/knee/shoulder/hip/neck
+// joints (dense ring loops at knees and elbows keep the fold smooth), so the
+// body DEFORMS instead of hinging like a puppet. The bind pose IS the rest
+// pose (all bone rotations zero), so frame one shows no T-pose flash.
+// Rigid pieces stay rigid, parented to bones: head + face rig, chullo +
+// pompoms, poncho flaps, unku skirt + sleeves (cloth), qipi, cord, pututu,
+// sandals. The animation system is the original one, ported 1:1: it drives
+// bone.rotation / bone.position with the same names and the same math (run
+// cycle, jump tuck, slide, tumble, wave, blink, breathing, pompom spring,
+// footstep events).
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
@@ -29,6 +34,9 @@ function getMats() {
   const C = CONFIG.colors;
   sharedMats = {
     skin: makeMat({ color: C.skinBrown, roughness: 0.72 }),
+    // Dedicated instance for the SkinnedMesh so the skinned shader program
+    // never has to share a material with rigid meshes.
+    skinBody: makeMat({ color: C.skinBrown, roughness: 0.72 }),
     hair: makeMat({ color: C.hairBlack, roughness: 0.95 }),
     eyeWhite: makeMat({ color: 0xffffff, roughness: 0.25 }),
     iris: makeMat({ color: 0x38230f, roughness: 0.3 }),
@@ -72,14 +80,12 @@ function addPivot(parent, x = 0, y = 0, z = 0) {
   return g;
 }
 
-// Capsule whose cylinder spans the joint (y=0) down to -len, so both end cap
-// CENTERS sit exactly on the adjacent joint pivots. With a joint sphere of
-// the same radius the cap and the sphere coincide when straight, and the
-// sphere fills the wedge when bent: the limb reads as one continuous tube.
-function boneCapsule(r, len) {
-  const g = new THREE.CapsuleGeometry(r, len, 4, 10);
-  g.translate(0, -len / 2, 0);
-  return g;
+function addBone(parent, name, x = 0, y = 0, z = 0) {
+  const b = new THREE.Bone();
+  b.name = name;
+  b.position.set(x, y, z);
+  parent.add(b);
+  return b;
 }
 
 // Curved poncho cloth: an open partial cone wrapped around the torso axis,
@@ -106,45 +112,207 @@ function makeFlapGeo(rT, rB, yTop, yBot, sweep, waveAmp, cornerLift, refTop, ref
   return geo;
 }
 
+// ---------------------------------------------------------------------------
+// Skinned body geometry. Bone indices into the skeleton bone list:
+// ---------------------------------------------------------------------------
+const B = {
+  hips: 0, torso: 1, neck: 2, head: 3,
+  legL: 4, kneeL: 5, footL: 6,
+  legR: 7, kneeR: 8, footR: 9,
+  armL: 10, elbowL: 11, armR: 12, elbowR: 13,
+};
+
+// One continuous low-poly body (torso + both arms + both legs) built from
+// capsule-ish tubes of ring loops. Every ring stores a 2-bone blend
+// (w0 on b0, 1-w0 on b1) computed by distance along the limb to the joint,
+// with a soft graded falloff (7 rings, 0.01-0.02 m spacing, across each knee
+// and elbow: this is what keeps the fold from collapsing into a crease).
+// Vertices are authored in character space (origin at feet), which is also
+// the bind pose: all bone rotations zero.
+function buildBodyGeometry() {
+  const pos = [], idx = [], sIdx = [], sWgt = [];
+
+  // rings: [y, r, b0, b1, w0, cx = 0, sx = 1, sz = 1], ordered bottom to top.
+  function tube(radial, rings, poleBotY, poleTopY) {
+    const start = pos.length / 3;
+    for (let i = 0; i < rings.length; i++) {
+      const ring = rings[i];
+      const y = ring[0], r = ring[1], b0 = ring[2], b1 = ring[3], w0 = ring[4];
+      const cx = ring[5] || 0, sx = ring[6] || 1, sz = ring[7] || 1;
+      for (let k = 0; k < radial; k++) {
+        const a = (k / radial) * TAU;
+        pos.push(cx + Math.cos(a) * r * sx, y, Math.sin(a) * r * sz);
+        sIdx.push(b0, b1, 0, 0);
+        sWgt.push(w0, 1 - w0, 0, 0);
+      }
+    }
+    // Side quads (outward winding).
+    for (let i = 0; i < rings.length - 1; i++) {
+      for (let k = 0; k < radial; k++) {
+        const a = start + i * radial + k;
+        const b = start + i * radial + ((k + 1) % radial);
+        const c = a + radial;
+        const d = b + radial;
+        idx.push(a, c, b, b, c, d);
+      }
+    }
+    // Bottom pole cap.
+    const r0 = rings[0], rN = rings[rings.length - 1];
+    const pBot = pos.length / 3;
+    pos.push(r0[5] || 0, poleBotY, 0);
+    sIdx.push(r0[2], r0[3], 0, 0);
+    sWgt.push(r0[4], 1 - r0[4], 0, 0);
+    for (let k = 0; k < radial; k++) {
+      idx.push(pBot, start + k, start + ((k + 1) % radial));
+    }
+    // Top pole cap.
+    const pTop = pos.length / 3;
+    const lastRow = start + (rings.length - 1) * radial;
+    pos.push(rN[5] || 0, poleTopY, 0);
+    sIdx.push(rN[2], rN[3], 0, 0);
+    sWgt.push(rN[4], 1 - rN[4], 0, 0);
+    for (let k = 0; k < radial; k++) {
+      idx.push(pTop, lastRow + ((k + 1) % radial), lastRow + k);
+    }
+  }
+
+  // Leg tube: foot dome region, ankle blend, shin, dense knee loops, thigh,
+  // hip blend embedded in the pelvis. cx = +-0.095.
+  function leg(cx, T, K, F, H) {
+    tube(18, [
+      [0.050, 0.048, F, F, 1.00, cx],
+      [0.080, 0.054, F, F, 1.00, cx],
+      [0.105, 0.057, F, K, 0.72, cx],
+      [0.130, 0.058, F, K, 0.42, cx],
+      [0.160, 0.060, F, K, 0.15, cx],
+      [0.200, 0.061, K, K, 1.00, cx],
+      [0.255, 0.063, K, K, 1.00, cx],
+      [0.305, 0.065, K, K, 1.00, cx],
+      [0.340, 0.066, K, T, 0.82, cx],
+      [0.360, 0.067, K, T, 0.66, cx],
+      [0.370, 0.068, K, T, 0.58, cx],
+      [0.380, 0.068, K, T, 0.50, cx],
+      [0.390, 0.069, K, T, 0.42, cx],
+      [0.400, 0.070, K, T, 0.34, cx],
+      [0.420, 0.072, K, T, 0.18, cx],
+      [0.455, 0.076, T, T, 1.00, cx],
+      [0.510, 0.081, T, T, 1.00, cx],
+      [0.565, 0.084, T, T, 1.00, cx],
+      [0.615, 0.080, T, H, 0.80, cx],
+      [0.650, 0.074, T, H, 0.55, cx],
+    ], 0.030, 0.664);
+  }
+  leg(0.095, B.legL, B.kneeL, B.footL, B.hips);
+  leg(-0.095, B.legR, B.kneeR, B.footR, B.hips);
+
+  // Arm tube: hand bulge (replaces the old rigid hand sphere), wrist pinch,
+  // forearm, dense elbow loops, upper arm, shoulder blend leaning into the
+  // torso under the yoke and sleeve. s = +-1.
+  function arm(s, A, E) {
+    const cx = s * 0.225;
+    tube(18, [
+      [0.600, 0.030, E, E, 1.00, cx, 0.95, 1.05],
+      [0.622, 0.050, E, E, 1.00, cx, 0.95, 1.08],
+      [0.650, 0.058, E, E, 1.00, cx, 0.95, 1.08],
+      [0.678, 0.052, E, E, 1.00, cx, 0.95, 1.05],
+      [0.706, 0.044, E, E, 1.00, cx],
+      [0.745, 0.048, E, E, 1.00, cx],
+      [0.795, 0.050, E, E, 1.00, cx],
+      [0.830, 0.051, E, A, 0.85, cx],
+      [0.850, 0.052, E, A, 0.68, cx],
+      [0.860, 0.052, E, A, 0.59, cx],
+      [0.870, 0.053, E, A, 0.50, cx],
+      [0.880, 0.053, E, A, 0.41, cx],
+      [0.890, 0.054, E, A, 0.32, cx],
+      [0.910, 0.054, E, A, 0.15, cx],
+      [0.945, 0.055, A, A, 1.00, cx],
+      [0.985, 0.057, A, A, 1.00, cx],
+      [1.020, 0.059, A, B.torso, 0.85, s * 0.223],
+      [1.045, 0.056, A, B.torso, 0.62, s * 0.215],
+      [1.062, 0.042, A, B.torso, 0.40, s * 0.205],
+    ], 0.585, 1.072);
+  }
+  arm(1, B.armL, B.elbowL);
+  arm(-1, B.armR, B.elbowR);
+
+  // Torso tube: pelvis (hips bone) to neck (neck/head blend). Sits a few mm
+  // INSIDE the rigid tunic chest lathe so they never z-fight; the tube only
+  // surfaces at the collar, where it reads as the neck emerging from the
+  // tunic, and it is what welds shoulders, hips and head into one body.
+  tube(20, [
+    [0.575, 0.118, B.hips, B.hips, 1.00, 0, 1, 0.88],
+    [0.605, 0.150, B.hips, B.hips, 1.00, 0, 1, 0.88],
+    [0.635, 0.161, B.hips, B.torso, 0.66, 0, 1, 0.88],
+    [0.665, 0.167, B.hips, B.torso, 0.40, 0, 1, 0.88],
+    [0.700, 0.170, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [0.760, 0.172, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [0.825, 0.168, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [0.885, 0.160, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [0.945, 0.147, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [1.000, 0.128, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [1.035, 0.098, B.torso, B.torso, 1.00, 0, 1, 0.88],
+    [1.060, 0.072, B.torso, B.neck, 0.62, 0, 1, 0.90],
+    [1.085, 0.062, B.neck, B.torso, 0.75, 0, 1, 0.92],
+    [1.110, 0.058, B.neck, B.neck, 1.00, 0, 1, 0.95],
+    [1.135, 0.056, B.neck, B.head, 0.72, 0, 1, 0.95],
+    [1.160, 0.055, B.neck, B.head, 0.50, 0, 1, 0.95],
+  ], 0.558, 1.175);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(sIdx, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(sWgt, 4));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 export function buildChasqui() {
   const MT = getMats();
   const group = new THREE.Group();
   const geos = [];
   const G = (g) => { geos.push(g); return g; };
 
-  // ---- Skeleton (identical pivots to the original rig) --------------------
-  const hips = addPivot(group, 0, HIP_Y, 0);
-  const torso = addPivot(hips, 0, 0, 0);
-  const neck = addPivot(torso, 0, 0.46, 0);
-  const head = addPivot(neck, 0, 0.13, 0);
+  // ---- Skeleton: THREE.Bone hierarchy at the original pivots --------------
+  const hips = addBone(group, 'hips', 0, HIP_Y, 0);
+  const torso = addBone(hips, 'torso', 0, 0, 0);
+  const neck = addBone(torso, 'neck', 0, 0.46, 0);
+  const head = addBone(neck, 'head', 0, 0.13, 0);
 
-  const legL = addPivot(hips, 0.095, 0.02, 0);
-  const kneeL = addPivot(legL, 0, -0.26, 0);
-  const footL = addPivot(kneeL, 0, -0.26, 0);
-  const legR = addPivot(hips, -0.095, 0.02, 0);
-  const kneeR = addPivot(legR, 0, -0.26, 0);
-  const footR = addPivot(kneeR, 0, -0.26, 0);
+  const legL = addBone(hips, 'legL', 0.095, 0.02, 0);
+  const kneeL = addBone(legL, 'kneeL', 0, -0.26, 0);
+  const footL = addBone(kneeL, 'footL', 0, -0.26, 0);
+  const legR = addBone(hips, 'legR', -0.095, 0.02, 0);
+  const kneeR = addBone(legR, 'kneeR', 0, -0.26, 0);
+  const footR = addBone(kneeR, 'footR', 0, -0.26, 0);
 
-  const armL = addPivot(torso, 0.225, 0.42, 0);
-  const elbowL = addPivot(armL, 0, -0.17, 0);
-  const armR = addPivot(torso, -0.225, 0.42, 0);
-  const elbowR = addPivot(armR, 0, -0.17, 0);
+  const armL = addBone(torso, 'armL', 0.225, 0.42, 0);
+  const elbowL = addBone(armL, 'elbowL', 0, -0.17, 0);
+  const armR = addBone(torso, 'armR', -0.225, 0.42, 0);
+  const elbowR = addBone(armR, 'elbowR', 0, -0.17, 0);
 
-  // ---- Legs: one continuous tube per limb (equal radii, embedded joints) --
-  const R_LEG = 0.062;
-  const thighGeo = G(boneCapsule(R_LEG, 0.26));
-  const shinGeo = G(boneCapsule(R_LEG, 0.26));
-  const kneeGeo = G(new THREE.SphereGeometry(R_LEG, 10, 8));
-  addMesh(legL, thighGeo, MT.skin);
-  addMesh(legR, thighGeo, MT.skin);
-  addMesh(kneeL, kneeGeo, MT.skin);
-  addMesh(kneeR, kneeGeo, MT.skin);
-  addMesh(kneeL, shinGeo, MT.skin);
-  addMesh(kneeR, shinGeo, MT.skin);
+  const bones = [
+    hips, torso, neck, head,
+    legL, kneeL, footL,
+    legR, kneeR, footR,
+    armL, elbowL, armR, elbowR,
+  ];
 
-  // Sandal: flat rounded sole, soft foot dome, toe strap arc, ankle ball,
-  // and a tall ojota strap cuff that dresses the shin-foot joint.
-  // Foot pivot world y = 0.12; sole bottom rests at y ~0.007 (never below 0).
+  // ---- Skinned body (bind pose = rest pose = current zero rotations) ------
+  const body = new THREE.SkinnedMesh(G(buildBodyGeometry()), MT.skinBody);
+  body.castShadow = true;
+  // The body deforms around the origin the character sits at; culling by the
+  // static bind-pose bounds would pop it during tumbles.
+  body.frustumCulled = false;
+  group.add(body);
+  group.updateMatrixWorld(true);
+  const skeleton = new THREE.Skeleton(bones);
+  body.bind(skeleton);
+
+  // ---- Rigid attachments (parented to bones) ------------------------------
+  // Sandal: flat rounded sole, soft foot dome, toe strap arc, and a tall
+  // ojota strap cuff that dresses the skinned ankle. Foot pivot world y =
+  // 0.12; sole bottom rests at y ~0.007 (never below 0).
   const soleGeo = G(new RoundedBoxGeometry(0.105, 0.03, 0.19, 2, 0.012));
   const domeGeo = G(new THREE.SphereGeometry(0.054, 12, 9));
   const strapGeo = G(new THREE.TorusGeometry(0.048, 0.009, 5, 10, Math.PI));
@@ -156,16 +324,14 @@ export function buildChasqui() {
     const strap = addMesh(f, strapGeo, MT.sandal, 0, -0.086, -0.062);
     strap.scale.set(1, 0.6, 1);
     strap.rotation.x = -0.12;
-    // Ankle ball reuses the knee sphere: same radius as the shin capsule, so
-    // the ankle stays a continuous surface while the foot flexes.
-    addMesh(f, kneeGeo, MT.skin);
     addMesh(f, cuffGeo, MT.sandal, 0, -0.03, -0.004);
   }
 
-  // ---- Torso: rounded shorts, lathe barrel chest, poncho yoke -------------
+  // Rounded shorts over the skinned pelvis.
   const shortsMesh = addMesh(torso, G(new THREE.SphereGeometry(0.175, 14, 10)), MT.shorts, 0, 0.045, 0);
   shortsMesh.scale.set(0.94, 0.62, 0.9);
 
+  // Tunic chest: lathe barrel worn OVER the skinned torso.
   const chestPts = [
     new THREE.Vector2(0.115, 0.035),
     new THREE.Vector2(0.158, 0.10),
@@ -233,49 +399,28 @@ export function buildChasqui() {
   );
   addMesh(torso, G(new THREE.TubeGeometry(cordCurve, 10, 0.016, 6, false)), MT.sandal);
 
-  // Pututu conch at the right hip: lathe spiral shell.
+  // Pututu conch at the right hip: lathe spiral shell. Hangs low and out so
+  // it sits in the unku's side slit instead of vanishing under the skirt.
   const conchPts = [];
   for (let i = 0; i <= 8; i++) {
     const t = i / 8;
     conchPts.push(new THREE.Vector2(0.012 + Math.sin(t * Math.PI) * 0.052 * (1 - t * 0.3), t * 0.17));
   }
-  // Hangs a touch lower and further out than before so it sits in the unku's
-  // side slit instead of vanishing under the new skirt.
   const conch = addMesh(hips, G(new THREE.LatheGeometry(conchPts, 10)), MT.conch, -0.215, -0.09, 0.05);
   conch.rotation.set(0.4, 0, -1.2);
 
-  // ---- Arms: continuous equal-radius tubes under short cloth sleeves ------
-  // Upper capsule, elbow sphere and forearm capsule share one radius with cap
-  // centers on the pivots (elbow + wrist joints fully embedded); the hand
-  // ball is fatter than the forearm so the wrist cap disappears inside it.
-  const R_ARM = 0.052;
+  // ---- Sleeves + shoulder fill (rigid cloth riding the upper arm bones) ---
   const shoulderGeo = G(new THREE.SphereGeometry(0.063, 10, 8));
-  const upperGeo = G(boneCapsule(R_ARM, 0.17));
-  const elbowGeo = G(new THREE.SphereGeometry(R_ARM, 9, 7));
-  const foreGeo = G(boneCapsule(R_ARM, 0.20));
-  const handGeo = G(new THREE.SphereGeometry(0.062, 10, 8));
-  // Flared short sleeve on the UPPER arm bone: swings with the arm, swallows
-  // the shoulder and elbow joints; woven trim band at the hem.
   const sleeveGeo = G(new THREE.CylinderGeometry(0.074, 0.096, 0.29, 10, 1, true));
   sleeveGeo.translate(0, -0.09, 0);
   const sleeveTrimGeo = G(new THREE.CylinderGeometry(0.0965, 0.1005, 0.034, 10, 1, true));
   sleeveTrimGeo.translate(0, -0.218, 0);
   addMesh(armL, shoulderGeo, MT.tunic);
   addMesh(armR, shoulderGeo, MT.tunic);
-  addMesh(armL, upperGeo, MT.skin);
-  addMesh(armR, upperGeo, MT.skin);
   addMesh(armL, sleeveGeo, MT.tunicCloth);
   addMesh(armR, sleeveGeo, MT.tunicCloth);
   addMesh(armL, sleeveTrimGeo, MT.ponchoTrim);
   addMesh(armR, sleeveTrimGeo, MT.ponchoTrim);
-  addMesh(elbowL, elbowGeo, MT.skin);
-  addMesh(elbowR, elbowGeo, MT.skin);
-  addMesh(elbowL, foreGeo, MT.skin);
-  addMesh(elbowR, foreGeo, MT.skin);
-  const handL = addMesh(elbowL, handGeo, MT.skin, 0, -0.20, 0);
-  handL.scale.set(1, 0.88, 1.02);
-  const handR = addMesh(elbowR, handGeo, MT.skin, 0, -0.20, 0);
-  handR.scale.set(1, 0.88, 1.02);
 
   // ---- Head and face ------------------------------------------------------
   const skull = addMesh(head, G(new THREE.SphereGeometry(0.20, 20, 16)), MT.skin, 0, 0.02, 0);
@@ -545,7 +690,7 @@ export function buildChasqui() {
     skirtF.rotation.x = clamp((thMax > 0 ? thMax : 0) * 0.92 + 0.10 - tX, -0.25, 1.9);
     skirtB.rotation.x = clamp((thMin < 0 ? thMin : 0) * 0.92 - 0.08 - tX, -1.9, 0.25);
 
-    // ---- Apply skeleton -----------------------------------------------------
+    // ---- Apply skeleton (bone rotations; the SkinnedMesh follows) -----------
     legL.rotation.x = thL; kneeL.rotation.x = knL; footL.rotation.x = ftL;
     legR.rotation.x = thR; kneeR.rotation.x = knR; footR.rotation.x = ftR;
     armL.rotation.x = aLx; armL.rotation.z = aLz;
@@ -607,6 +752,7 @@ export function buildChasqui() {
 
   function dispose() {
     for (const g of geos) g.dispose();
+    skeleton.dispose();
   }
 
   return { group, update, setMode, onFootstep, dispose };

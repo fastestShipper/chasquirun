@@ -93,15 +93,30 @@ uniform vec3 uBot;
 uniform vec3 uGlow;
 uniform vec3 uSunDir;
 uniform float uNight;
+uniform float uDesat;
 varying vec3 vDir;
 void main() {
   vec3 d = normalize(vDir);
   float h = max(d.y, 0.0);
-  vec3 col = mix(uBot, uMid, smoothstep(0.0, 0.24, h));
-  col = mix(col, uTop, smoothstep(0.24, 0.85, h));
+  // Rayleigh-flavored optical depth proxy: the air column thickens sharply
+  // toward the horizon, so zenith blue deepens fast and the horizon band
+  // stays compressed (calibrated so t=0.48 keeps the crystal-noon palette,
+  // with more depth overhead than the old linear 3-stop gradient).
+  float od = pow(1.0 - h, 1.7);
+  vec3 col = mix(uTop, uMid, smoothstep(0.0, 0.62, od));
+  col = mix(col, uBot, smoothstep(0.55, 0.96, od));
   if (d.y < 0.0) col = uBot * (1.0 + d.y * 0.35);
-  float s = max(dot(d, uSunDir), 0.0);
-  col += uGlow * (pow(s, 14.0) * 0.45 + pow(s, 90.0) * 0.35);
+  // Mie forward-scattering lobe (Henyey-Greenstein, g = 0.76): a warm haze
+  // pools around the sun and strengthens in the thicker horizon air. A tight
+  // pow term keeps the bright aureole right at the disc.
+  float cosT = dot(d, uSunDir);
+  float g = 0.76;
+  float mie = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosT, 1.5);
+  float s = max(cosT, 0.0);
+  col += uGlow * (mie * 0.02 * (0.6 + 0.4 * od) + pow(s, 90.0) * 0.35);
+  // Horizon desaturation: distant scattered light drifts toward neutral.
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(col, vec3(lum), uDesat * smoothstep(0.5, 0.98, od));
   // Milky Way: faint band around a fixed tilted great circle, plus a
   // 2-octave hash sparkle inside it. Gated to zero by day via uNight.
   if (uNight > 0.001) {
@@ -364,6 +379,37 @@ function makeLensTexture() {
   return t;
 }
 
+function makeCirrusTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 64;
+  const ctx = c.getContext('2d');
+  const rnd = mulberry32(913);
+  // Layered near-horizontal streaks with soft radial falloff: ice-crystal
+  // veil combed by high-altitude wind.
+  for (let i = 0; i < 11; i++) {
+    const cx = 26 + rnd() * 204;
+    const cy = 10 + rnd() * 44;
+    const rx = 36 + rnd() * 82;
+    const ry = 2 + rnd() * 4.5;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((rnd() - 0.5) * 0.14);
+    ctx.scale(1, ry / rx);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx);
+    g.addColorStop(0, 'rgba(255,255,255,0.42)');
+    g.addColorStop(0.6, 'rgba(255,255,255,0.18)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(-rx, -rx, rx * 2, rx * 2);
+    ctx.restore();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  return t;
+}
+
 function makeMoonTexture() {
   const s = 128;
   const c = document.createElement('canvas');
@@ -423,6 +469,20 @@ export class SkySystem {
       sunI: 1, hemiI: 1, cloudOp: 0.4, haze: 0.5, elev: 0.5, az: 0,
     };
 
+    // Aerial-perspective snapshot handed out by getEnv(). One cached object:
+    // the Vector3/Color fields are LIVE references into _sunDir/_cur (so
+    // palette updates propagate for free); fogNear/fogFar mirror scene.fog,
+    // which main.js owns. Consumers treat everything as read-only.
+    this._env = {
+      sunDir: this._sunDir,
+      sunColor: this._cur.sun,
+      hemiSky: this._cur.hemiSky,
+      hemiGround: this._cur.hemiGround,
+      fogColor: this._cur.fog,
+      fogNear: 90,
+      fogFar: 400,
+    };
+
     // --- Sun light (main.js may toggle castShadow per quality tier) ---
     const q = CONFIG.quality.high;
     this.sunLight = new THREE.DirectionalLight(0xffffff, 2.0);
@@ -450,6 +510,7 @@ export class SkySystem {
         uGlow: { value: this._cur.glow },
         uSunDir: { value: this._sunDir },
         uNight: { value: 0 },
+        uDesat: { value: 0 },
       },
       vertexShader: DOME_VERT,
       fragmentShader: DOME_FRAG,
@@ -458,6 +519,7 @@ export class SkySystem {
       fog: false,
     });
     this._dome = new THREE.Mesh(new THREE.SphereGeometry(800, 32, 18), this._domeMat);
+    this._dome.name = 'skyDome'; // stable handle for the integrator's PMREM capture
     this._dome.frustumCulled = false;
     this._dome.renderOrder = -1000;
     scene.add(this._dome);
@@ -548,6 +610,7 @@ export class SkySystem {
     cctx.globalCompositeOperation = 'source-over';
     const cloudTex = new THREE.CanvasTexture(cc);
     cloudTex.colorSpace = THREE.SRGBColorSpace;
+    this._cloudTex = cloudTex;
     for (let i = 0; i < 14; i++) {
       const m = new THREE.SpriteMaterial({
         map: cloudTex,
@@ -558,16 +621,62 @@ export class SkySystem {
       });
       const spr = new THREE.Sprite(m);
       const w = randRange(crnd, 140, 340);
-      spr.scale.set(w, w * randRange(crnd, 0.3, 0.42), 1);
+      const hh = w * randRange(crnd, 0.3, 0.42);
+      spr.scale.set(w, hh, 1);
       spr.frustumCulled = false;
+      // Positive order keeps the lit top above its shaded base twin. The
+      // base must NOT use a negative order: sprites sorted ahead of the
+      // whole transparent pass render as hard alpha-less slabs here.
+      spr.renderOrder = 1;
       this._scene.add(spr);
+      // Darker underside twin: shared texture, tinted in _applyTime, offset
+      // a few texels down and drawn first so the cumulus reads as a lit top
+      // over a shaded flat base (cheap 2-layer volume).
+      const mU = new THREE.SpriteMaterial({
+        map: cloudTex,
+        transparent: true,
+        depthWrite: false,
+        opacity: 0.3,
+        fog: false,
+      });
+      const sprU = new THREE.Sprite(mU);
+      sprU.scale.set(w * 1.03, hh * 1.03, 1);
+      sprU.frustumCulled = false;
+      this._scene.add(sprU);
       this._clouds.push({
-        spr, m,
+        spr, m, sprU, mU,
+        dy: hh * 0.055,
         ang: crnd() * TAU,
         rad: randRange(crnd, 240, 430),
         y: randRange(crnd, 100, 175),
         spd: randRange(crnd, 0.0015, 0.005) * (crnd() < 0.5 ? -1 : 1),
         opMul: randRange(crnd, 0.55, 1),
+      });
+    }
+
+    // --- High cirrus veil: 6 stretched wisps far above the cumulus deck ---
+    this._cirrusTex = makeCirrusTexture();
+    this._cirrus = [];
+    for (let i = 0; i < 6; i++) {
+      const m = new THREE.SpriteMaterial({
+        map: this._cirrusTex,
+        transparent: true,
+        depthWrite: false,
+        opacity: 0.14,
+        fog: false,
+      });
+      const spr = new THREE.Sprite(m);
+      const w = randRange(crnd, 360, 640);
+      spr.scale.set(w, w * randRange(crnd, 0.055, 0.085), 1);
+      spr.frustumCulled = false;
+      this._scene.add(spr);
+      this._cirrus.push({
+        spr, m,
+        ang: crnd() * TAU,
+        rad: randRange(crnd, 300, 520),
+        y: randRange(crnd, 200, 280),
+        spd: randRange(crnd, 0.0008, 0.002) * (crnd() < 0.5 ? -1 : 1),
+        opMul: randRange(crnd, 0.5, 1),
       });
     }
 
@@ -650,6 +759,15 @@ export class SkySystem {
     return outVec3.copy(this._sunDir);
   }
 
+  // Single source of truth for aerial perspective. Returns the SAME cached
+  // object every call (zero alloc): { sunDir, sunColor, hemiSky, hemiGround,
+  // fogColor, fogNear, fogFar }. sunDir/colors are live references kept in
+  // sync by _applyTime; fogColor is the palette target scene.fog.color eases
+  // toward; fogNear/fogFar mirror scene.fog (owned by main.js). Read-only.
+  getEnv() {
+    return this._env;
+  }
+
   _applyTime(t) {
     let i = 0;
     while (i < KEYS.length - 2 && t > KEYS[i + 1].t) i++;
@@ -703,11 +821,28 @@ export class SkySystem {
 
     this._farMat.uniforms.uHazeAmt.value = c.haze;
     this._midMat.uniforms.uHazeAmt.value = c.haze * 0.7;
+    // Horizon desaturation scales with the palette haze (thin at noon).
+    this._domeMat.uniforms.uDesat.value = c.haze * 0.28;
 
     for (let k = 0; k < this._clouds.length; k++) {
       const cl = this._clouds[k];
       cl.m.color.copy(c.cloud);
       cl.m.opacity = c.cloudOp * cl.opMul;
+      // Underside: shaded cloud color pulled toward the haze (all in place).
+      cl.mU.color.copy(c.cloud).multiplyScalar(0.66).lerp(c.fog, 0.28);
+      cl.mU.opacity = c.cloudOp * cl.opMul * 0.85;
+    }
+    for (let k = 0; k < this._cirrus.length; k++) {
+      const ci = this._cirrus[k];
+      ci.m.color.copy(c.cloud).lerp(WHITE, 0.4);
+      ci.m.opacity = c.cloudOp * ci.opMul * 0.42;
+    }
+
+    // Keep the env snapshot's fog scalars honest (main.js owns near/far).
+    const fog = this._scene.fog;
+    if (fog) {
+      this._env.fogNear = fog.near;
+      this._env.fogFar = fog.far;
     }
 
     // Night gate for the Milky Way band (late dusk and pre-dawn only).
@@ -765,19 +900,34 @@ export class SkySystem {
       L.spr.position.set(cp.x + L.px, L.y, cp.z + L.pz);
     }
 
-    // Fog eases toward the palette horizon color.
-    if (this._scene.fog) {
-      this._scene.fog.color.lerp(this._cur.fog, 1 - Math.exp(-2.5 * dt));
+    // Fog eases toward the palette horizon color (near/far owned by main.js;
+    // we only mirror them into the cached env snapshot).
+    const fog = this._scene.fog;
+    if (fog) {
+      fog.color.lerp(this._cur.fog, 1 - Math.exp(-2.5 * dt));
+      this._env.fogNear = fog.near;
+      this._env.fogFar = fog.far;
     }
 
-    // Clouds drift in slow arcs around the camera.
+    // Clouds drift in slow arcs around the camera; each underside twin rides
+    // just below its parent for the 2-layer parallax volume.
     for (let i = 0; i < this._clouds.length; i++) {
       const cl = this._clouds[i];
       cl.ang += cl.spd * dt;
-      cl.spr.position.set(
-        cp.x + Math.cos(cl.ang) * cl.rad,
-        cl.y,
-        cp.z + Math.sin(cl.ang) * cl.rad
+      const cx = cp.x + Math.cos(cl.ang) * cl.rad;
+      const cz = cp.z + Math.sin(cl.ang) * cl.rad;
+      cl.spr.position.set(cx, cl.y, cz);
+      cl.sprU.position.set(cx, cl.y - cl.dy, cz);
+    }
+
+    // Cirrus veil drifts slower and higher (distinct parallax band).
+    for (let i = 0; i < this._cirrus.length; i++) {
+      const ci = this._cirrus[i];
+      ci.ang += ci.spd * dt;
+      ci.spr.position.set(
+        cp.x + Math.cos(ci.ang) * ci.rad,
+        ci.y,
+        cp.z + Math.sin(ci.ang) * ci.rad
       );
     }
 
@@ -824,9 +974,17 @@ export class SkySystem {
     this._lenti.length = 0;
     this._lensTex.dispose();
     for (const cl of this._clouds) {
-      s.remove(cl.spr);
+      s.remove(cl.spr, cl.sprU);
       cl.m.dispose();
+      cl.mU.dispose();
     }
+    for (const ci of this._cirrus) {
+      s.remove(ci.spr);
+      ci.m.dispose();
+    }
+    this._cirrus.length = 0;
+    this._cirrusTex.dispose();
+    this._cloudTex.dispose();
     for (const cd of this._condors) {
       s.remove(cd.obj.group);
       cd.obj.group.traverse((o) => {

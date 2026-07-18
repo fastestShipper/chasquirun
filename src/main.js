@@ -5,6 +5,8 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 import { CONFIG } from './config.js';
@@ -23,6 +25,8 @@ import { Particles } from './particles.js';
 import { UI } from './ui.js';
 import { AudioSys } from './audio/engine.js';
 import { Scores } from './scores.js';
+import { loadModels } from './assets.js';
+import { setEnv as setTerrainEnv, setWorldOrigin as setTerrainOrigin } from './terrain.js';
 
 const STATE = { MENU: 0, COUNTDOWN: 1, RUN: 2, PAUSED: 3, DEAD: 4 };
 
@@ -66,6 +70,8 @@ async function boot() {
   // Photo PBR sets must be in before any material is built.
   setBoot('Cargando texturas reales...');
   await loadPhotoTextures();
+  setBoot('Cargando modelos 3D...');
+  await loadModels();
 
   // ---- World systems ----
   setBoot('Pintando el cielo de los Andes...');
@@ -77,6 +83,32 @@ async function boot() {
     }
   }
   sky.setTimeOfDay(CONFIG.timeOfDayStart);
+
+  // Image-based ambient light: a tiny gradient world PMREM-captured once.
+  // Metals and roughness now respond to sky/ground bounce instead of a flat
+  // hemisphere; this is most of the "plastic vs material" difference.
+  {
+    const envScene = new THREE.Scene();
+    const geo = new THREE.SphereGeometry(10, 24, 16);
+    const cols = new Float32Array(geo.attributes.position.count * 3);
+    const zen = new THREE.Color(0x2b63c4);
+    const hor = new THREE.Color(0xcfe2f2);
+    const gnd = new THREE.Color(0x6f7a4e);
+    const c = new THREE.Color();
+    for (let i = 0; i < geo.attributes.position.count; i++) {
+      const y = geo.attributes.position.getY(i) / 10;
+      if (y >= 0) c.copy(hor).lerp(zen, Math.min(1, y * 1.4));
+      else c.copy(hor).lerp(gnd, Math.min(1, -y * 2.2));
+      cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    envScene.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(envScene, 0.02).texture;
+    scene.environmentIntensity = 0.45;
+    geo.dispose();
+    pmrem.dispose();
+  }
 
   const midground = new Midground(scene);
   const water = new WaterSystem();
@@ -113,6 +145,25 @@ async function boot() {
     });
     composer = new EffectComposer(renderer, rt);
     composer.addPass(new RenderPass(scene, camera));
+    // Ground-truth ambient occlusion: contact darkening between objects is
+    // the single biggest "grounded vs floating" cue.
+    const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
+    gtao.updateGtaoMaterial({ radius: 0.35, thickness: 1, samples: 12, distanceExponent: 1 });
+    gtao.blendIntensity = 0.55;
+    // Sprites ignore override materials, so they smear garbage into the AO
+    // depth/normal buffers and read back as ghost rectangles in the sky.
+    // Hide every sprite for the AO pass only.
+    const _gtaoHidden = [];
+    const _gtaoOrigRender = gtao.render.bind(gtao);
+    gtao.render = (...args) => {
+      _gtaoHidden.length = 0;
+      scene.traverse((o) => {
+        if (o.isSprite && o.visible) { o.visible = false; _gtaoHidden.push(o); }
+      });
+      _gtaoOrigRender(...args);
+      for (const o of _gtaoHidden) o.visible = true;
+    };
+    composer.addPass(gtao);
     bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.32, 0.55, 0.85);
     composer.addPass(bloomPass);
     // Final grade: gentle vignette + split toning (cool shadows, warm
@@ -146,6 +197,7 @@ async function boot() {
         }`,
     });
     composer.addPass(gradePass);
+    composer.addPass(new SMAAPass(innerWidth, innerHeight));
     composer.addPass(new OutputPass());
   }
 
@@ -175,6 +227,10 @@ async function boot() {
   const playerPos = { x: 0, y: 0, z: 0 };
   const _dustV = new THREE.Vector3();
   const _fxV = new THREE.Vector3();
+  const _envV = new THREE.Vector3();
+  const _envC1 = new THREE.Color();
+  const _envC2 = new THREE.Color();
+  const _terrainEnv = { sunDir: null, sunColor: null, hemiColor: null, fogColor: null, fogNear: 90, fogFar: 400 };
 
   // ---- UI ----
   const click = () => AudioSys.play('uiClick');
@@ -615,6 +671,15 @@ async function boot() {
     // Atmosphere.
     sky.update(dtRaw, camera, G.dist);
     midground.update(dtRaw, camera);
+    // Splat terrain lighting/fog/anchor sync (single source of truth: sky).
+    _terrainEnv.sunDir = sky.getSunDir(_envV);
+    _terrainEnv.sunColor = _envC1.copy(sky.sunLight.color).multiplyScalar(sky.sunLight.intensity * 0.32);
+    _terrainEnv.hemiColor = _envC2.copy(sky.hemi.color).multiplyScalar(sky.hemi.intensity * 0.32);
+    _terrainEnv.fogColor = scene.fog.color;
+    _terrainEnv.fogNear = scene.fog.near;
+    _terrainEnv.fogFar = scene.fog.far;
+    setTerrainEnv(_terrainEnv);
+    setTerrainOrigin(track.worldGroup.position.x, track.worldGroup.position.z);
     if (sky.getSunDir && water.setSunDir) {
       sky.getSunDir(_fxV);
       water.setSunDir(_fxV);

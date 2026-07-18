@@ -25,6 +25,7 @@ import {
   Mats, Tex, makeMat, applyCurvatureSprite, applyWindCurvature, Curve, AnimU,
 } from './materials.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { getModel, cloneModel } from './assets.js';
 
 // ---------------------------------------------------------------------------
 // Shared constants, seed stream, temp objects
@@ -1204,14 +1205,36 @@ export function buildGrassFringe({ length = 36, width = 1.2 } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// buildBoulder: irregular faceted rock
+// buildBoulder: photogrammetry rock when loaded, irregular faceted fallback
 // ---------------------------------------------------------------------------
+// Scale 1.0 is the obstacle contract (obstacles.js builds at exactly 1.0 and
+// its jump/roller hitboxes expect real bulk), so it stays on the cubic
+// rock_a (~3.3k tris). Scenic boulders (0.55+) mix all three scans. Edge
+// gravel below 0.55 stays procedural on purpose: those stones spawn by the
+// dozen per chunk and an 80-tri icosahedron reads identically at 30 cm,
+// while a scan there would burn thousands of vertices each.
+
+const ROCKS_BULK = ['rock_a'];
+const ROCKS_MID = ['rock_a', 'rock_b', 'rock_c'];
 
 export function buildBoulder(scale = 1) {
   const rnd = nextRnd();
-  const m = new THREE.Mesh(boulderGeometry(rnd, scale), Mats.stoneDark());
-  m.castShadow = scale >= 0.7;
-  return m; // root mesh stays auto-updating for track.js placement
+  if (scale >= 0.55) {
+    const names = scale === 1 ? ROCKS_BULK : ROCKS_MID;
+    const pick = names[(rnd() * names.length) | 0];
+    const yaw = rnd() * TAU;
+    const m = cloneModel(pick, scale);
+    if (m && m.isMesh) {
+      // Template geometry is normalized to boulderGeometry's footprint with
+      // origin at base center, so caller placement and hitboxes carry over.
+      m.rotation.y = yaw;
+      m.castShadow = scale >= 0.7;
+      return m; // root mesh stays auto-updating for track.js placement
+    }
+  }
+  const f = new THREE.Mesh(boulderGeometry(rnd, scale), Mats.stoneDark());
+  f.castShadow = scale >= 0.7;
+  return f; // root mesh stays auto-updating for track.js placement
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,10 +1471,13 @@ function matFoamStrip() {
 }
 
 // ---------------------------------------------------------------------------
-// buildQueunaPatch / buildMollePatch: instanced Andean trees
+// buildQueunaPatch / buildMollePatch: Andean tree patches
 // ---------------------------------------------------------------------------
-// One InstancedMesh per patch over a shared vertex-colored template, so a
-// whole grove costs a single draw call and casts no shadows.
+// Fallback (no models loaded): one InstancedMesh per patch over a shared
+// vertex-colored template, one draw call, no shadows. With the asset pack,
+// molle patches become groups of photogrammetry bush clones and queuna
+// groves gain a couple of gnarled dead-trunk clones at their fringe (real
+// models cannot instance trivially, so clone counts stay hard-capped).
 
 export function buildQueunaPatch({ count = 5, area = [8, 30] } = {}) {
   const rnd = nextRnd();
@@ -1460,15 +1486,44 @@ export function buildQueunaPatch({ count = 5, area = [8, 30] } = {}) {
   // Template measures 2.93 m; 0.86..1.5 lands inside the 2.5..4.5 m band.
   scatterInstances(im, count, rnd, area[0] / 2, area[1] / 2, 0.86, 1.5, 0.03, 0.2);
   g.add(im);
+  // Up to two real dead trunks ground the grove; the green instanced canopy
+  // stays, keeping the warm valley identity (max 2 clones per patch).
+  if (getModel('tree_dead')) {
+    const n = Math.min(2, count);
+    for (let i = 0; i < n; i++) {
+      const t = cloneModel('tree_dead', 0.9 + rnd() * 0.35);
+      t.position.set(
+        (rnd() * 2 - 1) * area[0] / 2, 0, (rnd() * 2 - 1) * area[1] / 2
+      );
+      t.rotation.y = rnd() * TAU;
+      g.add(t);
+    }
+  }
   return freeze(g);
 }
+
+// Photogrammetry bush variants standing in for molle trees (assets.js).
+const MOLLE_SHRUBS = ['shrub_a', 'shrub_b', 'shrub_c', 'shrub_d'];
 
 export function buildMollePatch({ count = 3, area = [8, 30] } = {}) {
   const rnd = nextRnd();
   const g = new THREE.Group();
-  const im = new THREE.InstancedMesh(molleTreeGeo(), matTreeVC(), count);
-  scatterInstances(im, count, rnd, area[0] / 2, area[1] / 2, 0.85, 1.5, 0.03, 0.2);
-  g.add(im);
+  const have = MOLLE_SHRUBS.filter((n) => getModel(n));
+  if (have.length) {
+    const n = Math.min(count, 5); // hard cap: clones cannot instance
+    for (let i = 0; i < n; i++) {
+      const c = cloneModel(have[(rnd() * have.length) | 0], 0.85 + rnd() * 0.45);
+      c.position.set(
+        (rnd() * 2 - 1) * area[0] / 2, 0, (rnd() * 2 - 1) * area[1] / 2
+      );
+      c.rotation.y = rnd() * TAU;
+      g.add(c);
+    }
+  } else {
+    const im = new THREE.InstancedMesh(molleTreeGeo(), matTreeVC(), count);
+    scatterInstances(im, count, rnd, area[0] / 2, area[1] / 2, 0.85, 1.5, 0.03, 0.2);
+    g.add(im);
+  }
   return freeze(g);
 }
 

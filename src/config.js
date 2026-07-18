@@ -82,7 +82,7 @@ export const CONFIG = {
   timeOfDayPerMeter: 0,
 
   quality: {
-    high: { pixelRatioCap: 2, shadows: true, shadowMap: 2048, bloom: true },
+    high: { pixelRatioCap: 2, shadows: true, shadowMap: 4096, bloom: true },
     low:  { pixelRatioCap: 1.25, shadows: false, shadowMap: 0, bloom: false },
   },
 
