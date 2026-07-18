@@ -1,0 +1,11 @@
+{
+  "name": "chasqui-run",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chasqui Run: an endless runner set in the Inca world. Three.js / WebGL, fully self-contained.",
+  "scripts": {
+    "start": "python -m http.server 5173",
+    "serve": "npx --yes http-server -p 5173 -c-1 ."
+  }
+}
