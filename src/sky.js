@@ -8,6 +8,10 @@ import { Tex } from './materials.js';
 import { buildCondor } from './animals.js';
 
 const WHITE = new THREE.Color(0xffffff);
+// Alpenglow rose. Real low-sun light on snow goes further toward magenta than
+// the sky glow does, so the palette glow is pulled toward this rather than
+// used raw.
+const ALPEN_ROSE = new THREE.Color(0xff5c78);
 
 // Scratch for the mid-blend re-saturation (zero alloc per call).
 const _hsl = { h: 0, s: 0, l: 0 };
@@ -137,27 +141,186 @@ void main() {
 }
 `;
 
+// Mountains are lit for real: flat per-face normals from the ridge builder,
+// a sun diffuse term plus a hemispheric sky term, and snow decided in the
+// fragment shader from normalized peak height, face slope and fbm noise.
+// aAux packs the per-vertex data the shading needs:
+//   x = hy, height normalized inside its own peak (0 at the foot, 1 at summit)
+//   y = snow threshold in hy space (>1 means this peak never gets snow)
+//   z = per-peak random seed, decorrelates the noise fields between massifs
 const MTN_VERT = /* glsl */ `
+attribute vec3 aAux;
 varying vec3 vColor;
+varying vec3 vNrm;
+varying vec3 vLPos;
+varying vec3 vAux;
 varying float vY;
+varying float vDist;
 void main() {
   vColor = color;
+  vAux = aAux;
   vY = position.y;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  // OBJECT space, deliberately. The rings follow the camera every frame, so
+  // sampling the detail noise in world space would make it crawl across the
+  // mountains as the player runs. Local coords keep the rock nailed down.
+  vLPos = position;
+  // Rings are only ever scaled near-uniformly, so the plain model rotation
+  // is an adequate normal transform and saves a normalMatrix upload.
+  vNrm = normalize(mat3(modelMatrix) * normal);
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  vDist = -mv.z;
+  gl_Position = projectionMatrix * mv;
 }
 `;
 
 const MTN_FRAG = /* glsl */ `
 uniform vec3 uHaze;
 uniform vec3 uTint;
+uniform vec3 uSunDir;
+uniform vec3 uSunCol;
+uniform vec3 uSkyCol;
+uniform vec3 uGndCol;
+uniform vec3 uAlpenCol;
 uniform float uHazeAmt;
 uniform float uHazeH;
+uniform float uSunI;
+uniform float uAlpen;
 varying vec3 vColor;
+varying vec3 vNrm;
+varying vec3 vLPos;
+varying vec3 vAux;
 varying float vY;
+varying float vDist;
+
+// Sin-free hash. The usual fract(sin(dot(p,k))*43758.0) collapses into
+// banding once the coordinates get large, and these rings span +/-500 units,
+// so the fine octaves were degenerating into near-constant mush. This one
+// stays well behaved across the whole ring and is cheaper besides.
+float h21(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = h21(i);
+  float b = h21(i + vec2(1.0, 0.0));
+  float c = h21(i + vec2(0.0, 1.0));
+  float d = h21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Three octaves is the ceiling worth paying for on background geometry.
+float fbm(vec2 p) {
+  float s = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 3; i++) {
+    s += a * vnoise(p);
+    p *= 2.07;
+    a *= 0.5;
+  }
+  return s;
+}
+
 void main() {
+  vec3 N = normalize(vNrm);
+  float hy = vAux.x;
+  float snowBias = vAux.y;
+  float seed = vAux.z;
+
+  // Two noise scales: fine for rock mottling and gullies, coarse for the
+  // snowline wander and broad hue drift across a face.
+  vec2 sOff = vec2(seed * 91.7, seed * 57.3);
+  // One 2D frame whose second axis is mostly VERTICAL. Sampling plain XZ
+  // collapses on steep faces (both coords barely move as you climb) and
+  // smears the detail into long vertical streaks; folding height in gives
+  // real 2D variation on the faces for the cost of the same single fbm.
+  vec2 np = vec2(vLPos.x * 0.72 + vLPos.z * 0.69,
+                 vLPos.y * 1.15 + (vLPos.x - vLPos.z) * 0.22);
+  float fine = fbm(np * 0.13 + sOff);
+  // The snowline wander stays on XZ: it should vary AROUND the massif, not
+  // up it, or the threshold fights the altitude term it is modulating.
+  float coarse = vnoise(vLPos.xz * 0.012 + sOff * 0.4);
+
+  // --- Albedo ---------------------------------------------------------
+  vec3 alb = vColor;
+  // Mottling: gullies read darker, ribs catch a little more light.
+  alb *= 0.74 + 0.50 * fine;
+  // Slow hue drift so a big face is never one flat field of colour.
+  alb.r *= 0.96 + 0.09 * coarse;
+  alb.b *= 1.04 - 0.09 * coarse;
+
+  // --- Snow by altitude and slope --------------------------------------
+  // The threshold wanders with the coarse noise so the snowline is a ragged
+  // edge rather than a clean horizontal cut, and dips a little in gullies.
+  float line = snowBias + (0.5 - coarse) * 0.20 - (fine - 0.5) * 0.10;
+  float alt = smoothstep(line, line + 0.16, hy);
+  // Steep faces shed snow and stay bare rock; flatter shelves hold it.
+  float flatness = smoothstep(0.05, 0.52, N.y);
+  float snowK = alt * mix(0.10, 1.0, flatness);
+  // The summit crown keeps a rime coating even where it is steep.
+  snowK = clamp(max(snowK, alt * alt * alt * 0.62), 0.0, 1.0);
+  // Wind-scoured snow on steep ground goes blue-grey glacier ice.
+  vec3 snowAlb = mix(vec3(0.58, 0.66, 0.80), vec3(0.86, 0.89, 0.95), flatness);
+  // Sastrugi: wind-carved streaks. Stretched hard along the horizontal axis
+  // so the grain combs ACROSS the slope the way a prevailing wind lays it
+  // down, rather than running up and down the fall line.
+  float sast = vnoise(vec2(np.x * 0.04, np.y * 0.18) + sOff);
+  // Wind-packed crests sit bright and hard against softer lee drifts.
+  float packed = smoothstep(0.40, 0.78, fine);
+  snowAlb *= 0.86 + 0.18 * sast + 0.10 * packed;
+  alb = mix(alb, snowAlb, snowK);
+
+  // --- Lighting ---------------------------------------------------------
+  float ndl = dot(N, uSunDir);
+  float diff = max(ndl, 0.0);
+  // Snow scatters light through itself, so it wraps past the terminator.
+  float wrapped = max((ndl + 0.32) / 1.32, 0.0);
+  float lam = mix(diff, wrapped, 0.20 + 0.30 * snowK);
+  // Pseudo-relief: modulating the LIGHT term with the noise (not just the
+  // albedo) is what stops the big triangles reading as flat paper panels.
+  // Snow swaps in a sastrugi-dominated field so it gets its own form rather
+  // than borrowing the rock's; bright albedo alone reads as plaster.
+  float relief = mix(fine, 0.32 * fine + 0.68 * sast, snowK);
+  lam *= 0.74 + 0.50 * relief;
+  // Hemispheric fill: sky above, warm bounce from the valley below.
+  vec3 amb = mix(uGndCol, uSkyCol, N.y * 0.5 + 0.5);
+  // Snow shadows are famously blue: where the sun cannot reach, what is left
+  // is skylight. Applied as a HUE shift, weighted by how shadowed the point
+  // actually is, and NOT as a brightness lift. hemiSky is near-white at noon,
+  // so lifting toward it just blows the snow out into flat milk and destroys
+  // exactly the form this section exists to create.
+  float shadowed = 1.0 - smoothstep(0.0, 0.45, diff);
+  vec3 ambTerm = mix(amb, amb * vec3(0.80, 0.93, 1.24), snowK * shadowed);
+  // Contact darkening at the feet, where ridges overlap and self-shadow.
+  float foot = 0.68 + 0.32 * smoothstep(0.0, 0.16, hy);
+  vec3 col = alb * (uSunCol * (uSunI * 0.40) * lam + ambTerm * 0.52) * foot;
+  // Palette tint keeps the massifs inside the time-of-day colour scheme.
+  col = mix(col, col * uTint, 0.4);
+
+  // --- Alpenglow ---------------------------------------------------------
+  // With the sun near the horizon its light is long-path red, and only the
+  // high ground still sees it while the valleys have already gone into
+  // shadow. Gated hard by sun elevation on the JS side, so this contributes
+  // exactly nothing at midday and the branch is uniform across the draw.
+  if (uAlpen > 0.001) {
+    float high = smoothstep(0.38, 0.80, hy);
+    float facing = smoothstep(-0.10, 0.40, ndl);
+    float glowK = uAlpen * high * facing;
+    // Snow takes it hardest; bare rock catches a weaker warm wash.
+    col += uAlpenCol * (glowK * (0.18 + 0.82 * snowK) * 0.9);
+    // Everything below the glow band sinks further into shadow, which is
+    // what makes the lit summits read as floating above a dark valley.
+    col *= mix(1.0, 0.60 + 0.40 * high, uAlpen);
+  }
+
+  // --- Aerial perspective -----------------------------------------------
+  // Hugs the feet of the ridges; capped low so summits never bleach out.
   float hz = uHazeAmt * (1.0 - smoothstep(0.0, uHazeH, vY));
-  hz = min(hz + uHazeAmt * 0.08, 0.96);
-  vec3 col = mix(vColor * uTint, uHaze, hz);
+  hz = min(hz + uHazeAmt * 0.10 + smoothstep(380.0, 950.0, vDist) * uHazeAmt * 0.34, 0.90);
+  col = mix(col, uHaze, hz);
+
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -165,185 +328,327 @@ void main() {
 `;
 
 // ---------------------------------------------------------------------------
-// Far mountain ring geometry: craggy ridged massifs with baked snow caps.
-// Each peak stacks three jittered rings (base, low shoulder, high shoulder)
-// under a summit fan; per-face brightness variance bakes rock strata into
-// the vertex colors, and bare foothills layer in front of the major summits.
+// Far mountain ring geometry: a CONNECTED cordillera, not a row of cones.
+//
+// A real range is one continuous crest. Summits are local maxima ALONG that
+// crest, joined to their neighbours by cols and saddles, with spurs and
+// gullies running down the flanks. Building peaks as independent radial cones
+// (the old approach) can never produce that, however much jitter you add: it
+// gives a row of party hats. So the crest comes first here, and the surface
+// is swept off it.
+//
+// Per sweep:
+//   1. Place summits at angles around the ring.
+//   2. crestAt(theta) = a continuous base ridge + the tallest nearby summit
+//      bump. Where two bumps overlap you get a col; the base ridge is what
+//      keeps the chain joined instead of letting it drop to the valley floor.
+//   3. Sweep a cross-section profile off the crest, falling away on both
+//      sides, with the flank half-width modulated by angle so the flanks grow
+//      ribs and gullies rather than staying smooth cones.
+//
+// The builder emits a flat per-face NORMAL and the aAux attribute so the
+// existing lighting/snow shader keeps working unchanged.
 // ---------------------------------------------------------------------------
 
-function buildRidgeRing({ radius, count, hMin, hMax, seed, baseY, dramatic, peaksOut, snowMulBase = 1, vegTop = 0.42 }) {
+// Periodic 1D noise around the ring: a small stack of harmonics. Exactly
+// periodic, so there is no seam at theta = 0, and band-limited, so the
+// angular sampling below cannot alias it into spikes.
+function makeRingNoise(rnd, freqs) {
+  const n = freqs.length;
+  const fr = new Float64Array(n);
+  const ph = new Float64Array(n);
+  const am = new Float64Array(n);
+  let tot = 0;
+  for (let i = 0; i < n; i++) {
+    fr[i] = Math.max(1, Math.round(freqs[i]));
+    ph[i] = rnd() * TAU;
+    am[i] = 1 / Math.sqrt(fr[i]);
+    tot += am[i];
+  }
+  for (let i = 0; i < n; i++) am[i] /= tot;
+  return (th) => {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += am[i] * Math.sin(fr[i] * th + ph[i]);
+    return s;
+  };
+}
+
+function buildRidgeRing({ radius, count, hMin, hMax, seed, baseY, dramatic, peaksOut, snowMulBase = 1, vegTop = 0.26 }) {
   const rnd = mulberry32(seed);
   const positions = [];
   const colors = [];
+  const normals = [];
+  const aux = [];
   // Photo-real palette (Ausangate / Salkantay / Valle Sagrado references):
   // the mass of the mountain is warm brown rock; snow lives only in the
   // upper reaches, patchy, with tongues running down the couloirs.
   const rockA = new THREE.Color(0x6b573c);
   const rockB = new THREE.Color(0x7d6a52);
   const crag = new THREE.Color(0x5c5450);
-  // Vegetated lower slopes: sierra forest and field greens (Huascaran ref).
-  const vegA = new THREE.Color(0x437028);
-  const vegB = new THREE.Color(0x64943a);
+  const slate = new THREE.Color(0x6a6a68);
+  // Vegetated lower slopes. Sierra hillsides are muted olive and dry
+  // eucalyptus green, NOT tropical lime: saturated greens up here read as
+  // painted plastic and were the single worst thing about the old look.
+  const vegA = new THREE.Color(0x3c4a25);
+  const vegB = new THREE.Color(0x56682f);
   const veg = new THREE.Color();
-  const snow = new THREE.Color(0xf8fbff);
-  const ice = new THREE.Color(0xc2d8ee);
   const rock = new THREE.Color();
-  const tmp = new THREE.Color();
-  const tmp2 = new THREE.Color();
-  const tmp3 = new THREE.Color();
-  const S = 20;
 
-  // snowMul > 1 lifts the snowline above the summit (bare rocky foothills).
-  function addPeak(cx, cz, h, rb, snowMul = snowMulBase) {
-    rock.lerpColors(rockA, rockB, rnd());
-    veg.lerpColors(vegA, vegB, rnd());
-    const rot = rnd() * TAU;
-    // Heavy glaciation on the giants (the white wall of the reference);
-    // snowMul > 1 pushes it above the summit for the green front ranges.
-    const snowLine = h * (0.47 + rnd() * 0.09) * snowMul;
-    const blend = h * 0.1;
+  // Snow is decided by ABSOLUTE altitude, normalized against the ring's own
+  // tallest crest. A real cordillera has ONE snowline running level across
+  // every peak in it; normalizing per peak (the old way) gave every cone its
+  // own private snowline, which is exactly the wrong read. hRef is filled in
+  // once the main crest exists.
+  let hRef = 1;
+  let span = 1;
+  const snowHy = 0.46 * snowMulBase;
 
-    // Octave 1: four coarse radius lobes blended smoothly around the ring.
-    const lobes = [
-      0.72 + rnd() * 0.55, 0.72 + rnd() * 0.55,
-      0.72 + rnd() * 0.55, 0.72 + rnd() * 0.55,
-    ];
-    function coarseAt(t) {
-      const f = (t - Math.floor(t)) * 4;
-      const i0 = f | 0;
-      const u = f - i0;
-      const su = u * u * (3 - 2 * u);
-      return lerp(lobes[i0 % 4], lobes[(i0 + 1) % 4], su);
+  // Build one continuous crest: summit placement plus every angular field the
+  // sweep needs. Returns closures rather than baked arrays so the caller can
+  // scan it for hRef before committing to a sampling rate.
+  function makeCrest({ nS, hLo, hHi, rad, radAmp, major }) {
+    const summits = [];
+    for (let k = 0; k < nS; k++) {
+      // Uneven spacing. Evenly spaced summits of similar height read as a
+      // repeating sawtooth, which was the last thing making this look built
+      // rather than eroded.
+      const th = (k / nS) * TAU + (rnd() - 0.5) * (TAU / nS) * 0.9;
+      const isMajor = !!major && major(k);
+      // Skewed low: a real range is mostly modest summits with a few giants,
+      // not a uniform draw across the whole height band.
+      const h = lerp(hLo, hHi, Math.pow(rnd(), 1.8)) * (isMajor ? 1.6 : 1);
+      // Influence wider than the spacing, so neighbouring bumps overlap and
+      // meet at a col instead of each decaying to nothing in isolation. The
+      // wide spread matters: broad shallow massifs next to narrow sharp peaks.
+      summits.push({ th, h, w: (TAU / nS) * (0.62 + rnd() * 0.85), isMajor });
     }
-
-    // Octave 2: per-spoke jitter on every ring (angles, radii, heights).
-    const ang = [], br = [], lr = [], ly = [], mr = [], my = [], sh = [], rib = [];
-    const ur = [], uy = [];
-    for (let s = 0; s < S; s++) {
-      const c1 = coarseAt(s / S);
-      ang.push(rot + (s / S) * TAU + (rnd() - 0.5) * (TAU / S) * 0.5);
-      br.push(rb * c1 * (0.86 + rnd() * 0.3));
-      lr.push(rb * c1 * 0.6 * (0.76 + rnd() * 0.48));
-      ly.push(h * (0.15 + rnd() * 0.15));
-      mr.push(rb * c1 * 0.3 * (0.66 + rnd() * 0.62));
-      my.push(h * (0.42 + rnd() * 0.22));
-      // Upper shoulder: puts real vertices at the snowline so the summit
-      // band is white-on-vertices instead of a half-mountain gradient.
-      ur.push(rb * c1 * 0.15 * (0.6 + rnd() * 0.5));
-      uy.push(h * (0.68 + rnd() * 0.12));
-      sh.push(0.82 + rnd() * 0.3);
-      // Couloir snow tongue: some gullies carry snow well below the line.
-      // (Both draws are unconditional to keep the RNG stream deterministic.)
-      const tb = rnd();
-      const tv = h * (0.34 + rnd() * 0.08);
-      rib.push(tb < 0.26 ? tv : -1);
+    // A subsidiary summit hangs off each giant, joined by a high col. That
+    // shoulder is what makes a massif read as a massif and not a spike.
+    const shoulders = [];
+    for (const S2 of summits) {
+      if (!S2.isMajor) continue;
+      shoulders.push({
+        th: S2.th + (rnd() < 0.5 ? -1 : 1) * S2.w * 0.52,
+        h: S2.h * 0.66, w: S2.w * 0.6, isMajor: false,
+      });
     }
-    const ax = cx + (rnd() - 0.5) * rb * 0.12;
-    const az = cz + (rnd() - 0.5) * rb * 0.12;
+    for (const s of shoulders) summits.push(s);
 
-    function pushV(x, y, z, shade, tongueY, patch) {
-      positions.push(x, y, z);
-      // Patchy snow above an irregular high line, plus couloir tongues.
-      let k = clamp((y - (snowLine - blend)) / (2 * blend), 0, 1);
-      k = k * k * (3 - 2 * k);
-      if (tongueY >= 0 && y > tongueY) {
-        k = Math.max(k, 0.9 * clamp((y - tongueY) / (h * 0.14), 0, 1));
+    const hMean = (hLo + hHi) * 0.5;
+    // The connective tissue. Its own variation is what makes some links high
+    // shoulders and others deep passes.
+    const baseRidge = makeRingNoise(rnd, [1, 2, 3, 5, 8]);
+    const cragN = makeRingNoise(rnd, [nS, nS * 1.6, nS * 2.4]);
+    const radN = makeRingNoise(rnd, [1, 2, 3, 5]);
+    // Spurs and gullies. Frequencies stay well inside the angular sampling
+    // rate: alias these and the flanks turn into noise spikes.
+    const spurN = makeRingNoise(rnd, [nS * 0.7, nS * 1.2, nS * 1.8]);
+    const gullyN = makeRingNoise(rnd, [nS * 0.9, nS * 1.5, nS * 2.1]);
+    const corN = makeRingNoise(rnd, [nS * 0.5, nS]);
+    const rockN = makeRingNoise(rnd, [1, 2, 3]);
+    const rockN2 = makeRingNoise(rnd, [1, 3, 5]);
+    const snowN = makeRingNoise(rnd, [2, 3, 5]);
+
+    function crestAt(th) {
+      let bump = 0;
+      for (let k = 0; k < summits.length; k++) {
+        const S2 = summits[k];
+        let d = th - S2.th;
+        d -= TAU * Math.round(d / TAU);
+        const a = Math.abs(d) / S2.w;
+        if (a < 1) {
+          // (1 - a) rather than cos: it has a corner at the summit, so peaks
+          // come to a point instead of doming over into meringue.
+          const b = S2.h * Math.pow(1 - a, 1.45);
+          if (b > bump) bump = b;
+        }
       }
-      const kk = clamp(k * patch, 0, 1);
-      // Slopes: green forest low, brown rock band, gray crags at the snow
-      // margins. vegTop sets how high the green climbs (front ranges: high).
-      const hy = clamp((y - baseY) / ((h - baseY) || 1), 0, 1);
-      tmp3.copy(veg).lerp(rock, smoothstep(vegTop * 0.55, vegTop, hy));
-      tmp3.lerp(crag, clamp((hy - 0.52) * 1.7, 0, 1) * 0.5);
-      // Shaded snow leans glacial blue.
-      const iceK = clamp((1 - shade) * 2, 0, 0.6) * kk;
-      tmp2.copy(snow).lerp(ice, iceK);
-      tmp.lerpColors(tmp3, tmp2, kk);
-      const m = lerp(shade, 0.94 + shade * 0.06, kk);
-      colors.push(tmp.r * m, tmp.g * m, tmp.b * m);
+      const ridge = hMean * (0.30 + 0.16 * (0.5 + 0.5 * baseRidge(th)));
+      // Crest roughness: sub-summits and notches along the ridgeline. This is
+      // what keeps the skyline craggy rather than a run of smooth arcs.
+      return ridge + bump * 0.95 + hMean * 0.13 * cragN(th);
     }
-    // One flat-shaded face; per-face brightness variance reads as strata and
-    // per-face snow patchiness breaks the snowline into an irregular edge.
-    function tri(x0, y0, z0, x1, y1, z1, x2, y2, z2, shade, band, tongueY) {
-      const f = shade * band * (0.92 + rnd() * 0.16);
-      const patch = 0.5 + rnd() * 0.75;
-      pushV(x0, y0, z0, f, tongueY, patch);
-      pushV(x1, y1, z1, f, tongueY, patch);
-      pushV(x2, y2, z2, f, tongueY, patch);
+    const radAt = (th) => rad * (1 + radAmp * radN(th));
+    return {
+      crestAt, radAt, summits,
+      // Kept deliberately gentle. A big width swing corrugates the flank into
+      // sharp dark wedges that read as spikes, not as ridge-and-gully.
+      spurAt: (th) => 0.84 + 0.32 * (0.5 + 0.5 * spurN(th)),
+      gullyAt: gullyN,
+      corAt: (th) => Math.max(0, corN(th)),
+      rockAt: (th) => 0.5 + 0.5 * rockN(th),
+      slateAt: (th) => Math.max(0, rockN2(th)) * 0.8,
+      snowAt: (th) => snowN(th) * 0.05,
+    };
+  }
+
+  // Sweep a cross-section along a crest and append it to the buffers.
+  // s runs -1 (inner base, toward the camera) through 0 (the crest line)
+  // to +1 (outer base), sampled denser near the crest so the ridge stays
+  // crisp without spending vertices on the flat feet.
+  function sweep(C, { NA, NU, wInMul, wOutMul, cornice, seedZ, vegLocal }) {
+    const rows = NU + 1;
+    const sv = new Float64Array(rows);
+    for (let j = 0; j < rows; j++) {
+      const u = -1 + (2 * j) / NU;
+      sv[j] = Math.sign(u) * Math.pow(Math.abs(u), 1.7);
+    }
+    // Per-column fields, evaluated once instead of per vertex.
+    const cth = new Float64Array(NA);
+    const cch = new Float64Array(NA);
+    const cwi = new Float64Array(NA);
+    const cwo = new Float64Array(NA);
+    const cgu = new Float64Array(NA);
+    const cco = new Float64Array(NA);
+    const cbi = new Float64Array(NA);
+    const crx = new Float64Array(NA);
+    const crz = new Float64Array(NA);
+    const crr = new Float64Array(NA);
+    const rkR = new Float64Array(NA);
+    const rkG = new Float64Array(NA);
+    const rkB = new Float64Array(NA);
+    for (let i = 0; i < NA; i++) {
+      const th = (i / NA) * TAU;
+      const ch = C.crestAt(th);
+      const rr = C.radAt(th);
+      const sp = C.spurAt(th);
+      cth[i] = th;
+      cch[i] = ch;
+      crx[i] = Math.cos(th);
+      crz[i] = Math.sin(th);
+      cwi[i] = (ch - baseY) * wInMul * sp;
+      cwo[i] = (ch - baseY) * wOutMul * (1.9 - sp);
+      cgu[i] = C.gullyAt(th);
+      // Cornices only form up where there is snow to blow around.
+      const chy = (ch - baseY) / span;
+      cco[i] = cornice * C.corAt(th) * clamp((chy - snowHy + 0.12) / 0.3, 0, 1);
+      cbi[i] = snowHy + C.snowAt(th);
+      rock.lerpColors(rockA, rockB, C.rockAt(th));
+      rock.lerp(slate, C.slateAt(th));
+      rkR[i] = rock.r; rkG[i] = rock.g; rkB[i] = rock.b;
+      crr[i] = rr;
     }
 
-    for (let s = 0; s < S; s++) {
-      const s1 = (s + 1) % S;
-      const c0 = Math.cos(ang[s]), n0 = Math.sin(ang[s]);
-      const c1a = Math.cos(ang[s1]), n1 = Math.sin(ang[s1]);
-      const b0x = cx + c0 * br[s], b0z = cz + n0 * br[s];
-      const b1x = cx + c1a * br[s1], b1z = cz + n1 * br[s1];
-      const l0x = cx + c0 * lr[s], l0z = cz + n0 * lr[s];
-      const l1x = cx + c1a * lr[s1], l1z = cz + n1 * lr[s1];
-      const m0x = cx + c0 * mr[s], m0z = cz + n0 * mr[s];
-      const m1x = cx + c1a * mr[s1], m1z = cz + n1 * mr[s1];
-      const u0x = cx + c0 * ur[s], u0z = cz + n0 * ur[s];
-      const u1x = cx + c1a * ur[s1], u1z = cz + n1 * ur[s1];
-      const shade = sh[s];
-      const tongueS = rib[s];
-      // Foot band.
-      tri(b0x, baseY, b0z, b1x, baseY, b1z, l1x, ly[s1], l1z, shade, 0.96, tongueS);
-      tri(b0x, baseY, b0z, l1x, ly[s1], l1z, l0x, ly[s], l0z, shade, 0.96, tongueS);
-      // Mid-slope shoulder band.
-      tri(l0x, ly[s], l0z, l1x, ly[s1], l1z, m1x, my[s1], m1z, shade, 1.0, tongueS);
-      tri(l0x, ly[s], l0z, m1x, my[s1], m1z, m0x, my[s], m0z, shade, 1.0, tongueS);
-      // Upper shoulder band (crags to snowline).
-      tri(m0x, my[s], m0z, m1x, my[s1], m1z, u1x, uy[s1], u1z, shade, 1.02, tongueS);
-      tri(m0x, my[s], m0z, u1x, uy[s1], u1z, u0x, uy[s], u0z, shade, 1.02, tongueS);
-      // Summit cap.
-      tri(u0x, uy[s], u0z, u1x, uy[s1], u1z, ax, h, az, shade, 1.05, tongueS);
+    // Height of the swept surface at column i, cross-section row j.
+    function yAt(i, j) {
+      const s = sv[j];
+      const t = Math.abs(s);
+      const rise = cch[i] - baseY;
+      let y = baseY + rise * Math.pow(1 - t, 1.2);
+      // Mid-flank ripple: ribs and gullies, zero at the crest and the foot.
+      y += rise * 0.09 * cgu[i] * 4 * t * (1 - t);
+      // Cornice: a wind-built lip overhanging the lee side of a high crest.
+      if (s > 0 && s < 0.4 && cco[i] > 0) {
+        const e = (s - 0.13) / 0.11;
+        y += rise * 0.07 * cco[i] * Math.exp(-e * e);
+      }
+      return y;
+    }
+    function rAt(i, j) {
+      const s = sv[j];
+      return crr[i] + (s < 0 ? s * cwi[i] : s * cwo[i]);
+    }
+
+    function pushV(i, j, ci, nx, ny, nz) {
+      const r = rAt(i, j);
+      const y = yAt(i, j);
+      positions.push(crx[i] * r, y, crz[i] * r);
+      normals.push(nx, ny, nz);
+      const hy = clamp((y - baseY) / span, 0, 1);
+      aux.push(hy, cbi[ci], seedZ);
+      // Base albedo only: olive slopes low, rock band above, grey crags in
+      // the upper reaches. Snow and all lighting live in the shader.
+      const g = smoothstep(vegLocal * 0.5, vegLocal, hy);
+      const cg = clamp((hy - 0.46) * 1.8, 0, 1) * 0.45;
+      const r0 = lerp(lerp(veg.r, rkR[ci], g), crag.r, cg);
+      const g0 = lerp(lerp(veg.g, rkG[ci], g), crag.g, cg);
+      const b0 = lerp(lerp(veg.b, rkB[ci], g), crag.b, cg);
+      colors.push(r0, g0, b0);
+    }
+
+    // One flat-shaded face. Emission order is fixed: the sweep is a regular
+    // (angle, cross-section) parameterization, so d/dtheta x d/ds points
+    // outward everywhere and a single winding is correct for the whole
+    // surface. The normal is flipped only as a shading safety net.
+    function tri(i0, j0, i1, j1, i2, j2, ci) {
+      const r0 = rAt(i0, j0), r1 = rAt(i1, j1), r2 = rAt(i2, j2);
+      const ax = crx[i0] * r0, ay = yAt(i0, j0), az = crz[i0] * r0;
+      const bx = crx[i1] * r1, by = yAt(i1, j1), bz = crz[i1] * r1;
+      const cx2 = crx[i2] * r2, cy = yAt(i2, j2), cz2 = crz[i2] * r2;
+      let nx = (by - ay) * (cz2 - az) - (bz - az) * (cy - ay);
+      let ny = (bz - az) * (cx2 - ax) - (bx - ax) * (cz2 - az);
+      let nz = (bx - ax) * (cy - ay) - (by - ay) * (cx2 - ax);
+      const L = Math.hypot(nx, ny, nz) || 1;
+      nx /= L; ny /= L; nz /= L;
+      if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      pushV(i0, j0, ci, nx, ny, nz);
+      pushV(i1, j1, ci, nx, ny, nz);
+      pushV(i2, j2, ci, nx, ny, nz);
+    }
+
+    for (let i = 0; i < NA; i++) {
+      const i1 = (i + 1) % NA;
+      for (let j = 0; j < NU; j++) {
+        tri(i, j, i1, j, i, j + 1, i);
+        tri(i1, j, i1, j + 1, i, j + 1, i);
+      }
     }
   }
 
-  // Two recognizable dramatic peaks sit ahead of the runner (angle ~ 3/4 TAU).
-  const majors = [];
-  const kd1 = Math.round(count * 0.69);
-  const kd2 = Math.round(count * 0.81);
-  for (let k = 0; k < count; k++) {
-    const ang = (k / count) * TAU + (rnd() - 0.5) * (TAU / count) * 0.6;
-    const rad = radius + (rnd() - 0.5) * radius * 0.12;
-    const cx = Math.cos(ang) * rad;
-    const cz = Math.sin(ang) * rad;
-    let h = randRange(rnd, hMin, hMax);
-    let rb = h * randRange(rnd, 0.9, 1.4);
-    if (dramatic && (k === kd1 || k === kd2)) {
-      h *= 1.6;
-      rb *= 1.25;
-      if (peaksOut) peaksOut.push({ x: cx, z: cz, h });
-      addPeak(cx, cz, h, rb);
-      // Twin shoulder summit for a recognizable silhouette.
-      addPeak(cx + Math.cos(ang + 1.35) * rb * 0.55,
-              cz + Math.sin(ang + 1.35) * rb * 0.55, h * 0.62, rb * 0.55);
-      majors.push({ ang, rad, h, rb });
-    } else {
-      addPeak(cx, cz, h, rb);
-      if (h > hMax * 0.92) majors.push({ ang, rad, h, rb });
-    }
+  // --- Main crest -------------------------------------------------------
+  const kd1 = Math.round(count * 0.69) % count;
+  const kd2 = Math.round(count * 0.81) % count;
+  const main = makeCrest({
+    nS: count, hLo: hMin, hHi: hMax, rad: radius, radAmp: 0.10,
+    major: dramatic ? (k) => (k === kd1 || k === kd2) : null,
+  });
+  // Scan the finished crest for its true maximum: everything downstream
+  // (snowline, vegetation line, alpenglow band) is normalized against it.
+  for (let i = 0; i < 720; i++) {
+    const h = main.crestAt((i / 720) * TAU);
+    if (h > hRef) hRef = h;
   }
+  span = (hRef - baseY) || 1;
 
-  // Second, lower foothill band in front of the major summits: bare rock
-  // (lifted snowline), tighter bases, so the big massifs rise from layered
-  // ridgelines instead of standing as lone cones.
-  for (const M of majors) {
-    const n = 3 + ((rnd() * 2) | 0);
-    for (let f = 0; f < n; f++) {
-      const fa = M.ang + (rnd() - 0.5) * 0.26;
-      const fr = M.rad * (0.74 + rnd() * 0.14);
-      addPeak(
-        Math.cos(fa) * fr, Math.sin(fa) * fr,
-        M.h * (0.26 + rnd() * 0.18), M.rb * (0.38 + rnd() * 0.24), 2.5
-      );
+  veg.lerpColors(vegA, vegB, rnd());
+  sweep(main, {
+    NA: dramatic ? 448 : 352, NU: dramatic ? 10 : 8,
+    wInMul: 0.95, wOutMul: 0.95, cornice: 1, seedZ: 0.0, vegLocal: vegTop,
+  });
+
+  // --- Foothill crest ---------------------------------------------------
+  // A second, lower connected chain in front of the main one. It falls below
+  // the shared snowline on its own merits, so the big massifs rise out of
+  // layered ridgelines instead of standing straight up off the valley floor.
+  const foot = makeCrest({
+    nS: Math.round(count * 1.35), hLo: hMin * 0.22, hHi: hMax * 0.30,
+    rad: radius * 0.80, radAmp: 0.13, major: null,
+  });
+  veg.lerpColors(vegA, vegB, 0.35 + rnd() * 0.5);
+  sweep(foot, {
+    NA: dramatic ? 256 : 192, NU: dramatic ? 6 : 4,
+    wInMul: 1.25, wOutMul: 1.0, cornice: 0, seedZ: 0.37,
+    // Rockier than the main range despite sitting lower: these read as the
+    // dry front ranges, and an all-green apron swamps the massifs behind it.
+    vegLocal: vegTop * 0.7,
+  });
+
+  // Twin peak anchors for the lenticular cloud stacks.
+  if (peaksOut) {
+    for (const S2 of main.summits) {
+      if (!S2.isMajor) continue;
+      const r = main.radAt(S2.th);
+      peaksOut.push({
+        x: Math.cos(S2.th) * r, z: Math.sin(S2.th) * r, h: main.crestAt(S2.th),
+      });
     }
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
   geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
+  geo.setAttribute('aAux', new THREE.BufferAttribute(new Float32Array(aux), 3));
   geo.computeBoundingSphere();
   return geo;
 }
@@ -458,6 +763,8 @@ export class SkySystem {
     this._snowNear = 0;
     this._snowNearTarget = 0;
     this._sunDir = new THREE.Vector3(0, 1, 0);
+    // Alpenglow tint, rebuilt in place by _applyTime (never reallocated).
+    this._alpenCol = new THREE.Color();
 
     // Blended palette state. Dome and mountain uniforms reference these
     // Color instances directly, so _applyTime updates propagate for free.
@@ -529,6 +836,15 @@ export class SkySystem {
       uniforms: {
         uHaze: { value: this._cur.fog },
         uTint: { value: this._cur.mtn },
+        // Live references into the blended palette and sun direction, so
+        // _applyTime/update propagate to the shading with zero extra work.
+        uSunDir: { value: this._sunDir },
+        uSunCol: { value: this._cur.sun },
+        uSkyCol: { value: this._cur.hemiSky },
+        uGndCol: { value: this._cur.hemiGround },
+        uAlpenCol: { value: this._alpenCol },
+        uSunI: { value: 1 },
+        uAlpen: { value: 0 },
         uHazeAmt: { value: 0.5 },
         uHazeH: { value: hazeH },
       },
@@ -550,7 +866,7 @@ export class SkySystem {
       this._farMat
     );
     this._midRing = new THREE.Mesh(
-      buildRidgeRing({ radius: 380, count: 20, hMin: 50, hMax: 95, seed: 502, baseY: -10, dramatic: false, snowMulBase: 2.6, vegTop: 0.8 }),
+      buildRidgeRing({ radius: 380, count: 20, hMin: 50, hMax: 95, seed: 502, baseY: -10, dramatic: false, snowMulBase: 2.6, vegTop: 0.52 }),
       this._midMat
     );
     this._farRing.frustumCulled = false;
@@ -647,8 +963,12 @@ export class SkySystem {
         spr, m, sprU, mU,
         dy: hh * 0.055,
         ang: crnd() * TAU,
-        rad: randRange(crnd, 240, 430),
-        y: randRange(crnd, 100, 175),
+        // BEYOND the range, not inside it. The connected crest sits at radius
+        // 500 with flanks reaching well inward, so the old 240-430 deck was
+        // literally embedded in the mountains, drawing huge soft sprites
+        // across their faces and milking the whole frame out.
+        rad: randRange(crnd, 545, 700),
+        y: randRange(crnd, 150, 300),
         spd: randRange(crnd, 0.0015, 0.005) * (crnd() < 0.5 ? -1 : 1),
         opMul: randRange(crnd, 0.55, 1),
       });
@@ -673,8 +993,8 @@ export class SkySystem {
       this._cirrus.push({
         spr, m,
         ang: crnd() * TAU,
-        rad: randRange(crnd, 300, 520),
-        y: randRange(crnd, 200, 280),
+        rad: randRange(crnd, 600, 760),
+        y: randRange(crnd, 330, 430),
         spd: randRange(crnd, 0.0008, 0.002) * (crnd() < 0.5 ? -1 : 1),
         opMul: randRange(crnd, 0.5, 1),
       });
@@ -821,6 +1141,17 @@ export class SkySystem {
 
     this._farMat.uniforms.uHazeAmt.value = c.haze;
     this._midMat.uniforms.uHazeAmt.value = c.haze * 0.7;
+    this._farMat.uniforms.uSunI.value = c.sunI;
+    this._midMat.uniforms.uSunI.value = c.sunI;
+
+    // Alpenglow ramps in purely on SUN ELEVATION, so it fires at dawn, golden
+    // hour and dusk and is exactly zero around midday (elev 0.9 at t = 0.5).
+    // The shipping default t = 0.48 sits at elev ~0.90, so it never shows in
+    // normal play; it is still correct for when the clock does move.
+    const alpen = 1 - smoothstep(0.05, 0.62, c.elev);
+    this._alpenCol.copy(c.glow).lerp(ALPEN_ROSE, 0.55).multiplyScalar(0.5);
+    this._farMat.uniforms.uAlpen.value = alpen;
+    this._midMat.uniforms.uAlpen.value = alpen * 0.7;
     // Horizon desaturation scales with the palette haze (thin at noon).
     this._domeMat.uniforms.uDesat.value = c.haze * 0.28;
 

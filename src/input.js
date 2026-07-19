@@ -18,7 +18,7 @@ export class Input {
         case 'ArrowRight': case 'KeyD': action = 'right'; break;
         case 'ArrowUp': case 'KeyW': case 'Space': action = 'jump'; break;
         case 'ArrowDown': case 'KeyS': action = 'slide'; break;
-        case 'ShiftLeft': case 'ShiftRight': action = 'nitro'; break;
+        case 'ShiftLeft': case 'ShiftRight': action = 'intiRay'; break;
         case 'Escape': case 'KeyP': action = 'pause'; break;
       }
       if (action) {

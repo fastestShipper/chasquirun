@@ -80,6 +80,12 @@ const CHORDS = {
 // Soft zampona pad roots for section B (octave 3).
 const PAD_ROOT = { Em: 52, G: 55, Am: 57, C: 48, D: 50 };
 
+// KILLA's leitmotif: three quena notes, E5 down to C#5 (a minor third), then
+// down again to Bb4, the flat second of A minor. Against the E of the drone
+// that last note is a tritone: the sourest interval in reach. It is a wrong
+// note played on purpose by someone very pleased with herself.
+const KILLA_MOTIF = [[76, 0.26, 0.62], [73, 0.22, 0.58], [70, 0.9, 0.85]];
+
 // Huayno strum pattern over 8 sixteenths: down accent on 1, the classic
 // short-short push into beat 2, an up-brush at the bar's tail.
 const STRUM = [
@@ -117,13 +123,26 @@ SECTIONS.A.mel = compile(THEME_A);
 SECTIONS.A2.mel = compile(THEME_A2);
 SECTIONS.B.mel = compile(THEME_B);
 
+// The live music instance. engine.js calls createMusic exactly once; keeping
+// the handle here lets sfx.js fire the KILLA sting without the engine growing
+// a new public method. Safe to call at any time, including before init().
+let liveMusic = null;
+
+// KILLA's entrance: ducks the mix, drops the drums, plays the motif naked,
+// then brings everything back. Returns true if it actually fired.
+export function killaSting() {
+  if (!liveMusic) return false;
+  try { return liveMusic.killaSting(); } catch (e) { return false; }
+}
+
 // ---------------------------------------------------------------------------
 // Factory. A = { ctx, musicBus, quenaDelayIn, noise } from the engine.
 // ---------------------------------------------------------------------------
 export function createMusic(A) {
   const { ctx, musicBus, quenaDelayIn, noise } = A;
   const ksCache = new Map();
-  let ses = null; // active session
+  let ses = null;     // active session
+  let stingEnd = 0;   // KILLA sting: absolute time the mix is fully back
 
   // ---- Karplus-Strong charango: rendered once per pitch into a buffer, so
   // every pluck at play time is a single cheap AudioBufferSourceNode.
@@ -376,6 +395,8 @@ export function createMusic(A) {
       srcs: [],          // persistent sources (menu drone) to stop on fade
       menuNext: t + 1.4,
       phraseIdx: 0,
+      drumsHold: false,  // KILLA sting: percussion is dropped, not faded
+      drumsUntil: 0,     // earliest time the bombo may re-enter
     };
   }
 
@@ -456,13 +477,26 @@ export function createMusic(A) {
     const { sec, barIn, brk } = sectionAt(bar);
     const chordName = sec.chords[barIn % sec.chords.length];
 
+    // KILLA sting: the drums are gone until the first downbeat at or after the
+    // mix has come back, so the bombo always re-enters on beat 1, never mid bar.
+    if (s.drumsHold) {
+      if (sb === 0 && t >= s.drumsUntil) {
+        s.drumsHold = false;
+        const pg = s.pBus.gain;
+        pg.cancelScheduledValues(t);
+        pg.setValueAtTime(1, t); // silent bus, so a step here cannot click
+      }
+    }
+
     // Percussion: strong beat 1, supportive beat 2, ghost tail on odd bars.
-    if (sb === 0) bombo(s.pBus, t, 1.0);
-    if (sb === 4) bombo(s.pBus, t, brk ? 0.7 : 0.5);
-    if (sb === 6 && (barIn & 1)) bombo(s.pBus, t, 0.28);
-    if (brk && sb === 2) bombo(s.pBus, t, 0.4);
-    if (sb === 2 || sb === 6) chajchas(s.pBus, t, 0.55);
-    if (brk && (sb & 1)) chajchas(s.pBus, t, 0.32);
+    if (!s.drumsHold) {
+      if (sb === 0) bombo(s.pBus, t, 1.0);
+      if (sb === 4) bombo(s.pBus, t, brk ? 0.7 : 0.5);
+      if (sb === 6 && (barIn & 1)) bombo(s.pBus, t, 0.28);
+      if (brk && sb === 2) bombo(s.pBus, t, 0.4);
+      if (sb === 2 || sb === 6) chajchas(s.pBus, t, 0.55);
+      if (brk && (sb & 1)) chajchas(s.pBus, t, 0.32);
+    }
 
     // Charango: huayno strums, or rolled arpeggios under the zampona.
     if (sec === SECTIONS.B) {
@@ -537,6 +571,7 @@ export function createMusic(A) {
   function start(kind) {
     if (ses && ses.kind === kind) return;
     stop(0.5);
+    stingEnd = 0; // the old session took its duck with it
     ses = newSession(kind);
     if (kind === 'menu') buildDrone(ses);
     ses.timer = setInterval(tick, TICK_MS);
@@ -590,5 +625,88 @@ export function createMusic(A) {
     }, 4000);
   }
 
-  return { start, stop, sting };
+  // KILLA's entrance sting. The motif is NOT layered over the arrangement:
+  // the music stops to look at her. The mix ducks 12 dB in 80 ms, the bombo
+  // and chajchas drop out completely, the three quena notes ring naked over
+  // whatever drone is left, then the mix returns over 400 ms and the bombo
+  // comes back in on the downbeat. The silence is the sting.
+  //
+  // Every gain move is scheduled up front, so the mix restores itself even if
+  // nothing ever calls back in. Overlapping calls are refused, never stacked.
+  function killaSting() {
+    const now = ctx.currentTime;
+    if (now < stingEnd) return false; // one diva at a time
+    const t0 = now + 0.03;
+    const DUCK = 0.2512;   // -12 dB
+    const DUCK_T = 0.08;
+    const REST_T = 0.4;
+
+    // The motif rides its own bus straight into musicBus, so the duck applied
+    // to the session below can never touch it.
+    const bus = ctx.createGain();
+    bus.connect(musicBus);
+    const echo = ctx.createGain();
+    echo.gain.value = 0.5;
+    bus.connect(echo);
+    echo.connect(quenaDelayIn);
+
+    let tt = t0 + DUCK_T + 0.03;
+    let prev = 0;
+    for (let i = 0; i < KILLA_MOTIF.length; i++) {
+      const hz = midiHz(KILLA_MOTIF[i][0]);
+      // Slight length jitter so repeated stings are never bit identical.
+      const dur = KILLA_MOTIF[i][1] * (0.96 + Math.random() * 0.08);
+      quena(bus, tt, hz, dur, KILLA_MOTIF[i][2], prev, 0.08);
+      prev = hz;
+      tt += dur * 0.98;
+    }
+    const tailEnd = tt + 0.3;          // let the last note hang, alone
+    const restoreEnd = tailEnd + REST_T;
+    stingEnd = restoreEnd;
+
+    const s = ses;
+    if (s) {
+      // Read the live value BEFORE cancel, same hazard as stop().
+      const gp = s.song.gain;
+      const live = Math.max(gp.value, 0.0001);
+      gp.cancelScheduledValues(t0);
+      gp.setValueAtTime(live, t0);
+      gp.exponentialRampToValueAtTime(DUCK, t0 + DUCK_T);
+      gp.setValueAtTime(DUCK, tailEnd);
+      gp.exponentialRampToValueAtTime(1, restoreEnd);
+      if (s.kind === 'game') {
+        // Kill drum hits already sitting in the lookahead window, then stop
+        // scheduling new ones until the downbeat after the restore.
+        const pg = s.pBus.gain;
+        pg.cancelScheduledValues(t0);
+        pg.setValueAtTime(Math.max(pg.value, 0.0001), t0);
+        pg.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+        s.drumsHold = true;
+        // The first downbeat at or after the restore BEGINS, not after it
+        // ends: otherwise a downbeat landing just short of the restore costs a
+        // whole extra bar of drumless music. This way the bombo lands inside
+        // the 400 ms ramp and is what brings the mix back up.
+        s.drumsUntil = tailEnd;
+      }
+      // Paranoia: if anything went sideways with the scheduled ramps, force
+      // the mix back. Skipped when the session is gone or a sting is running.
+      setTimeout(() => {
+        if (ses !== s) return;
+        const n2 = ctx.currentTime;
+        if (n2 < stingEnd) return;
+        if (s.song.gain.value > 0.98) return;
+        s.song.gain.cancelScheduledValues(n2);
+        s.song.gain.setTargetAtTime(1, n2, 0.08);
+      }, (restoreEnd - now + 0.6) * 1000);
+    }
+
+    setTimeout(() => {
+      try { bus.disconnect(); echo.disconnect(); } catch (e) { /* fine */ }
+    }, (restoreEnd - now + 3) * 1000);
+    return true;
+  }
+
+  const api = { start, stop, sting, killaSting };
+  liveMusic = api;
+  return api;
 }

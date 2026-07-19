@@ -8,17 +8,25 @@
 //   ambience loops    -> ambBus  ----------> ambVol  --+
 //   musicVol/sfxVol --(sends)--> convolver (2.2 s generated IR) -> master
 //   quenaDelayIn -> delay 0.28 s (lowpass + fb 0.3 in loop) -> musicBus
+//   recorded samples -> sfxBus (same path as the synth one-shots)
 //
 // Every public method is a safe no-op before init() and never throws.
+//
+// SFX have two possible sources. play() prefers a recorded sample from
+// samples.js when one is loaded for that name, and otherwise falls through to
+// the synthesized patch in sfx.js. The synth path is always present and is
+// what runs when assets are missing, so the game never loses a sound.
 
 import { createMusic } from './music.js';
 import { createSfx, createAmbience } from './sfx.js';
+import { loadSamples, createSamplePlayer, sampleCount } from './samples.js';
 
 let ctx = null;
 let nodes = null;
 let music = null;
 let sfx = null;
 let amb = null;
+let samples = null;
 
 // Settings that may arrive before the first user gesture.
 const pending = { muted: false, musicVol: 1, sfxVol: 1 };
@@ -153,6 +161,11 @@ export const AudioSys = {
       music = createMusic(A);
       sfx = createSfx(A);
       amb = createAmbience(A);
+      samples = createSamplePlayer(A);
+      // Normally main.js has already called preloadSamples() during boot and
+      // this resolves instantly. If it did not, the fetch starts now and the
+      // synth covers every sound until the buffers land.
+      loadSamples();
       this.setMuted(pending.muted);
       this.setMusicVol(pending.musicVol);
       this.setSfxVol(pending.sfxVol);
@@ -184,11 +197,47 @@ export const AudioSys = {
     try { music.stop(fadeSec === undefined ? 0.8 : fadeSec); } catch (e) { /* fine */ }
   },
 
+  // Killa's entrance: the mix ducks, the percussion drops out, and her three
+  // sour quena notes play naked over the drone. The silence is the sting.
+  killaSting() {
+    if (!music) return false;
+    try { return music.killaSting(); } catch (e) { return false; }
+  },
+
+  // Fetch and decode the recorded samples. Safe to call before init() and
+  // before any user gesture: decoding uses a throwaway OfflineAudioContext.
+  // Always resolves (to the number of samples available), never rejects, so a
+  // boot sequence can await it without a guard.
+  preloadSamples() {
+    try { return loadSamples(); } catch (e) { return Promise.resolve(0); }
+  },
+
+  // Diagnostic only: how many recorded samples decoded successfully.
+  get sampleCount() { return sampleCount(); },
+
   // One-shot SFX. Extra names beyond the game list: 'gameOver' (alias
   // 'sting') plays the descending quena game-over phrase.
+  //
+  // A recorded sample wins when one is loaded for this name; otherwise this
+  // behaves exactly as it always did. Anything that goes wrong in the sample
+  // path returns false and falls through to the synth.
   play(name, opts) {
     if (!ctx) return;
     try {
+      const key = name === 'sting' ? 'gameOver' : name;
+      if (name === 'coin') {
+        // Layered on purpose. Either half alone is worse: the sample without
+        // the ladder loses the streak escalation and turns fatiguing when
+        // fired ten times a second, and the ladder without the sample has no
+        // metallic bite and never feels like picking something up.
+        const played = samples && samples.play(key, opts || {});
+        if (sfx) {
+          const o = opts || {};
+          sfx.play('coin', { combo: o.combo, vol: (o.vol === undefined ? 1 : o.vol) * (played ? 0.55 : 1) });
+        }
+        return;
+      }
+      if (samples && samples.play(key, opts || {})) return;
       if (name === 'gameOver' || name === 'sting') {
         if (music) music.sting();
         return;

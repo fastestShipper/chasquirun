@@ -16,6 +16,15 @@
   --cyan: #3fc8d8;
   --violet: #a06ae8;
 
+  /* Killa, the diva llama nemesis: warm rose over plum, never red (red is
+     reserved for damage) and never gold-only (gold is the player's reward). */
+  --killa-rose: #e79ab6;
+  --killa-plum: #5c2c44;
+  --killa-plum-deep: #3a1a2c;
+  /* Llama spit: pale greenish white, deliberately unlike damage and gold. */
+  --spit: 214, 234, 196;
+  --spit-deep: 152, 186, 108;
+
   --serif: Georgia, 'Palatino Linotype', 'Book Antiqua', Palatino,
     'Times New Roman', serif;
 
@@ -671,9 +680,9 @@ body {
   pointer-events: none;
 }
 
-/* ------------------------------------------------------------ nitro button */
+/* ------------------------------------------------------------ intiRay button */
 
-.hud-nitro {
+.hud-rayo {
   position: absolute;
   right: calc(18px + var(--safe-r));
   bottom: calc(18px + var(--safe-b));
@@ -687,53 +696,73 @@ body {
   gap: 1px;
   background: radial-gradient(circle at 50% 42%, rgba(46, 34, 20, 0.92), rgba(20, 14, 8, 0.94));
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 235, 190, 0.12);
-  --nitro-p: 360deg;
+  --rayo-p: 360deg;
 }
 
-.hud-nitro .nitro-ring {
+.hud-rayo .rayo-ring {
   position: absolute;
   inset: -4px;
   border-radius: 50%;
-  background: conic-gradient(var(--gold) var(--nitro-p), rgba(120, 96, 60, 0.25) var(--nitro-p));
+  background: conic-gradient(var(--gold) var(--rayo-p), rgba(120, 96, 60, 0.25) var(--rayo-p));
   -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
   mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
   pointer-events: none;
 }
 
-.hud-nitro .nitro-ico {
+.hud-rayo .rayo-ico {
   width: 26px;
   height: 26px;
   opacity: 0.85;
 }
 
-.hud-nitro .nitro-label {
+.hud-rayo .rayo-label {
   font-size: 0.6rem;
   letter-spacing: 0.14em;
   color: var(--gold-light);
   opacity: 0.85;
 }
 
-.hud-nitro.is-ready .nitro-ring {
+.hud-rayo.is-ready .rayo-ring {
   background: conic-gradient(var(--gold-light) 360deg, transparent 0);
-  animation: nitro-pulse 1.6s ease-in-out infinite;
+  animation: rayo-pulse 1.6s ease-in-out infinite;
 }
 
-.hud-nitro.is-active .nitro-ring {
-  background: conic-gradient(#9df2ff var(--nitro-p), rgba(70, 110, 130, 0.3) var(--nitro-p));
+.hud-rayo.is-active .rayo-ring {
+  background: conic-gradient(#ffd766 var(--rayo-p), rgba(130, 96, 40, 0.3) var(--rayo-p));
+  box-shadow: 0 0 14px rgba(255, 200, 80, 0.75);
 }
 
-.hud-nitro.is-active .nitro-label { color: #9df2ff; }
+.hud-rayo.is-active .rayo-label { color: #ffd766; }
 
-.hud-nitro.is-cooldown { opacity: 0.75; }
-.hud-nitro.is-cooldown .nitro-ico { opacity: 0.4; }
+/* Cooling down: unmistakably unavailable. Desaturated and pushed red, with
+   the ring still draining so the player can read how long is left. Dimming
+   alone was too subtle to notice mid-run. */
+.hud-rayo.is-cooldown { opacity: 0.9; }
+.hud-rayo.is-cooldown .rayo-ico { opacity: 0.35; filter: grayscale(1); }
+.hud-rayo.is-cooldown .rayo-label { color: #c8564a; }
 
-@keyframes nitro-pulse {
+.hud-rayo.is-cooldown .rayo-ring {
+  background: conic-gradient(#c8564a var(--rayo-p), rgba(70, 26, 22, 0.45) var(--rayo-p));
+  box-shadow: none;
+}
+
+/* Snap back to ready: one quick gold pulse so the player knows without
+   looking away from the road. */
+@keyframes rayo-ready {
+  0% { transform: scale(1); filter: brightness(1); }
+  35% { transform: scale(1.22); filter: brightness(1.7); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+
+.hud-rayo.just-ready { animation: rayo-ready 0.5s ease-out; }
+
+@keyframes rayo-pulse {
   0%, 100% { filter: drop-shadow(0 0 3px rgba(233, 180, 76, 0.5)); }
   50% { filter: drop-shadow(0 0 10px rgba(245, 214, 138, 0.95)); }
 }
 
 @media (max-width: 720px) {
-  .hud-nitro { width: 62px; height: 62px; }
+  .hud-rayo { width: 62px; height: 62px; }
 }
 
 .pill {
@@ -853,6 +882,474 @@ body {
 @keyframes flash-fade {
   0% { opacity: 1; }
   100% { opacity: 0; }
+}
+
+/* ------------------------------------------------------------ llama spit */
+
+/* Fairness contract, enforced structurally rather than by eyeballing it:
+   1. READ BAND. The overlay has no full-screen child. Only two zones, 26vw
+      each, pinned to the outer edges, both overflow:hidden. The central
+      48vw (more than the required 44%) has no painted node above it, so
+      blurs, transforms and drips physically cannot leak into it.
+   2. OPACITY. The .splat root carries the only opacity animation and peaks
+      at 0.55. Everything inside composites under it, so no overlap of blobs
+      can ever exceed that ceiling.
+   3. AREA. Blob radii are multiples of --bs, an absolute length, so blobs
+      stay round instead of stretching into streaks on a tall phone. Summed
+      sum(rx * ry) over all layers is ~3.71 * bs^2, so total ellipse area is
+      pi * 3.71 * bs^2 ~= 11.7 * bs^2. With bs = 7vmin that lands at ~3.5% of
+      the viewport per zone across phone, laptop and desktop, so ~7% for a
+      'center' hit that lights both. Comfortably under the 12% budget. If you
+      add or grow a blob, redo that sum.
+   4. TIME. 0.78 s, fill mode both, ends at opacity 0. */
+
+.splat {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 15;
+  /* blob scale: vmin keeps the splat proportional on phone and desktop */
+  --bs: clamp(26px, 7vmin, 90px);
+  --splat-jx: 0%;
+  --splat-jy: 0%;
+  --splat-rot: 0deg;
+}
+
+.splat.run {
+  animation: splat-life 0.78s ease-out both;
+}
+
+@keyframes splat-life {
+  0% { opacity: 0; }
+  9% { opacity: 0.55; }
+  62% { opacity: 0.44; }
+  100% { opacity: 0; }
+}
+
+.splat-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 26vw;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.splat-l { left: 0; }
+
+/* Mirrored so one set of gradients serves both edges. The zone offsets stop
+   a 'center' hit from looking like a perfect butterfly. */
+.splat-r {
+  right: 0;
+  transform: scaleX(-1);
+  --zone-dx: 3%;
+  --zone-dy: -8%;
+  --zone-rot: 9deg;
+}
+
+.splat.hit-left .splat-l,
+.splat.hit-right .splat-r,
+.splat.hit-center .splat-zone {
+  opacity: 1;
+}
+
+/* Soft wet vignette hugging the hit edge, gone well before the read band. */
+.splat-zone::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(72% 58% at 0% 46%,
+      rgba(var(--spit), 0.34) 0%, rgba(var(--spit-deep), 0.1) 52%,
+      rgba(var(--spit-deep), 0) 76%),
+    linear-gradient(90deg,
+      rgba(var(--spit-deep), 0.62) 0%,
+      rgba(var(--spit-deep), 0.26) 24%,
+      rgba(var(--spit-deep), 0.08) 42%,
+      rgba(var(--spit-deep), 0) 60%);
+}
+
+.splat-blobs,
+.splat-drip {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.splat-blobs {
+  transform:
+    translate(
+      calc(var(--splat-jx) + var(--zone-dx, 0%)),
+      calc(var(--splat-jy) + var(--zone-dy, 0%))
+    )
+    rotate(calc(var(--splat-rot) + var(--zone-rot, 0deg)));
+}
+
+/* Inset negative so the blur never reveals a hard rectangle edge. */
+.splat-blobs::before {
+  content: '';
+  position: absolute;
+  inset: -12%;
+  filter: blur(1.2px);
+  background:
+    /* wet specular pips, painted on top, negligible area */
+    radial-gradient(calc(var(--bs) * 0.22) calc(var(--bs) * 0.13) at 12% 18%,
+      rgba(255, 255, 255, 0.6) 0%, rgba(255, 255, 255, 0) 72%),
+    radial-gradient(calc(var(--bs) * 0.18) calc(var(--bs) * 0.11) at 5% 52%,
+      rgba(255, 255, 255, 0.5) 0%, rgba(255, 255, 255, 0) 74%),
+    /* the blobs themselves: fat opaque cores, soft gelatinous rim */
+    radial-gradient(calc(var(--bs) * 1.18) calc(var(--bs) * 1) at 15% 22%,
+      rgba(var(--spit), 0.95) 0%, rgba(var(--spit), 0.84) 40%,
+      rgba(var(--spit-deep), 0.58) 68%, rgba(var(--spit-deep), 0) 92%),
+    /* satellites, overlapped on purpose to break the clean ellipse edges */
+    radial-gradient(calc(var(--bs) * 0.46) calc(var(--bs) * 0.4) at 26% 26%,
+      rgba(var(--spit), 0.9) 0%, rgba(var(--spit), 0.7) 44%,
+      rgba(var(--spit-deep), 0) 90%),
+    radial-gradient(calc(var(--bs) * 0.38) calc(var(--bs) * 0.34) at 15% 62%,
+      rgba(var(--spit), 0.88) 0%, rgba(var(--spit), 0.66) 44%,
+      rgba(var(--spit-deep), 0) 90%),
+    radial-gradient(calc(var(--bs) * 0.8) calc(var(--bs) * 0.66) at 39% 38%,
+      rgba(var(--spit), 0.92) 0%, rgba(var(--spit), 0.78) 42%,
+      rgba(var(--spit-deep), 0.5) 70%, rgba(var(--spit-deep), 0) 92%),
+    radial-gradient(calc(var(--bs) * 1.05) calc(var(--bs) * 0.92) at 8% 56%,
+      rgba(var(--spit), 0.95) 0%, rgba(var(--spit), 0.82) 40%,
+      rgba(var(--spit-deep), 0.56) 68%, rgba(var(--spit-deep), 0) 92%),
+    radial-gradient(calc(var(--bs) * 0.52) calc(var(--bs) * 0.46) at 45% 65%,
+      rgba(var(--spit), 0.88) 0%, rgba(var(--spit), 0.7) 46%,
+      rgba(var(--spit-deep), 0) 90%),
+    radial-gradient(calc(var(--bs) * 0.68) calc(var(--bs) * 0.56) at 26% 80%,
+      rgba(var(--spit), 0.9) 0%, rgba(var(--spit), 0.74) 44%,
+      rgba(var(--spit-deep), 0) 90%),
+    radial-gradient(calc(var(--bs) * 0.34) calc(var(--bs) * 0.3) at 52% 13%,
+      rgba(var(--spit), 0.85) 0%, rgba(var(--spit-deep), 0) 88%);
+  animation: splat-slide 0.78s cubic-bezier(0.15, 0.75, 0.35, 1) both;
+}
+
+/* Impact splat, then a short wet slide down the lens. */
+@keyframes splat-slide {
+  0% { transform: translateY(-1.1vh) scaleY(0.84); }
+  16% { transform: translateY(0) scaleY(1.07); }
+  100% { transform: translateY(2.4vh) scaleY(1.16); }
+}
+
+.splat-drip::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  filter: blur(1.1px);
+  background:
+    radial-gradient(calc(var(--bs) * 0.16) calc(var(--bs) * 0.62) at 20% 34%,
+      rgba(var(--spit), 0.92) 0%, rgba(var(--spit), 0.7) 46%,
+      rgba(var(--spit-deep), 0) 88%),
+    radial-gradient(calc(var(--bs) * 0.12) calc(var(--bs) * 0.46) at 43% 55%,
+      rgba(var(--spit), 0.85) 0%, rgba(var(--spit), 0.62) 46%,
+      rgba(var(--spit-deep), 0) 88%);
+  animation: splat-run 0.78s cubic-bezier(0.25, 0.6, 0.4, 1) both;
+}
+
+@keyframes splat-run {
+  0% { transform: translateY(-1.6vh) scaleY(0.5); opacity: 0; }
+  26% { opacity: 1; }
+  100% { transform: translateY(7vh) scaleY(1.7); opacity: 0; }
+}
+
+/* ---------------------------------------------------------- killa toast */
+
+/* Her voice. Bottom-left so it never argues with the neutral biome toast
+   (top-center), the coins (top-right) or the Rayo button (bottom-right). */
+
+/* ------------------------------------------------------------------ lore
+   The premise, stated once on the title screen. Quiet and literary: this is
+   flavour the player reads while deciding to press start, not an instruction. */
+
+.lore {
+  max-width: min(88vw, 480px);
+  margin: -4px auto 0;
+  font-size: clamp(0.76rem, 2.1vw, 0.94rem);
+  font-style: italic;
+  line-height: 1.45;
+  color: var(--parchment-dim);
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------------------------------------------------------------- tips
+   Gameplay reminders. Deliberately quiet: low on screen, small, and well
+   clear of the centre band where the player is reading the road. They must
+   never feel like a tutorial popup demanding attention. */
+
+.tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(78px + var(--safe-b));
+  transform: translate(-50%, 8px);
+  padding: 7px 16px;
+  border-radius: 999px;
+  background: rgba(24, 16, 10, 0.62);
+  border: 1px solid rgba(233, 180, 76, 0.28);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  color: var(--parchment-dim);
+  font-size: clamp(0.72rem, 1.9vw, 0.85rem);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  z-index: 3;
+}
+
+.tip.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@media (max-width: 720px) {
+  .tip {
+    bottom: calc(96px + var(--safe-b));
+    max-width: 84vw;
+    white-space: normal;
+    text-align: center;
+  }
+}
+
+/* ------------------------------------------------- Killa manga cut-in
+   Anime reaction cut-in instead of a text toast: a hard-bordered slanted
+   panel with her face, halftone screentone and speed lines. Anchored top
+   left, deliberately small and quick so it reads as a comic beat and never
+   competes with the road for attention. */
+
+.cutin {
+  position: absolute;
+  top: calc(76px + var(--safe-t));
+  left: calc(10px + var(--safe-l));
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-26px) scale(0.92);
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  z-index: 4;
+}
+
+/* Snap in with a touch of overshoot, the way a cut-in lands in animation. */
+.cutin.show {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+  transition: opacity 0.12s ease, transform 0.2s cubic-bezier(0.2, 1.7, 0.4, 1);
+}
+
+/* Speed lines raking away from the panel. */
+.cutin-lines {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 190px;
+  height: 128px;
+  transform: translateY(-50%) skewX(-12deg);
+  background: repeating-linear-gradient(
+    92deg,
+    rgba(24, 12, 18, 0.42) 0 2px,
+    transparent 2px 9px
+  );
+  -webkit-mask-image: linear-gradient(90deg, rgba(0, 0, 0, 0.85), transparent 78%);
+  mask-image: linear-gradient(90deg, rgba(0, 0, 0, 0.85), transparent 78%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cutin.show .cutin-lines {
+  animation: cutin-rake 0.5s ease-out both;
+}
+
+@keyframes cutin-rake {
+  0% { opacity: 0.85; transform: translateY(-50%) skewX(-12deg) translateX(-14px); }
+  100% { opacity: 0; transform: translateY(-50%) skewX(-12deg) translateX(10px); }
+}
+
+/* The portrait cell: slanted, hard black border, halftone behind her. */
+.cutin-panel {
+  position: relative;
+  width: 62px;
+  height: 62px;
+  flex: none;
+  transform: skewX(-9deg);
+  border: 2.5px solid #1b0f16;
+  border-radius: 3px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 42%, var(--killa-rose) 0%, var(--killa-plum) 72%),
+    var(--killa-plum-deep);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.55);
+}
+
+/* Screentone: the dot grid that makes it read as printed comic art. */
+.cutin-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(rgba(28, 14, 22, 0.5) 1px, transparent 1.2px);
+  background-size: 5px 5px;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.cutin-face {
+  position: absolute;
+  inset: 0;
+  display: block;
+  transform: skewX(9deg); /* undo the panel skew so she is not distorted */
+  color: var(--parchment);
+}
+
+.cutin-ico {
+  width: 100%;
+  height: 100%;
+  display: block;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
+}
+
+.cutin-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  transform: skewX(9deg);
+  text-align: center;
+  font-size: 0.5rem;
+  letter-spacing: 0.16em;
+  padding: 1px 0 2px;
+  color: #22121c;
+  background: var(--gold);
+  font-weight: 700;
+}
+
+/* The line she says, in its own slanted plate butted against the portrait. */
+.cutin-txt {
+  align-self: center;
+  max-width: min(46vw, 300px);
+  margin-left: -3px;
+  padding: 7px 13px 7px 15px;
+  transform: skewX(-9deg);
+  border: 2.5px solid #1b0f16;
+  border-left: 0;
+  border-radius: 0 4px 4px 0;
+  background: linear-gradient(180deg, #fdf6e4, #e6d7b6);
+  color: #2a1a12;
+  font-size: clamp(0.72rem, 2vw, 0.86rem);
+  font-style: italic;
+  line-height: 1.25;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}
+
+.cutin-txt:empty { display: none; }
+
+/* Un-skew the glyphs so only the plate is slanted, not the words. */
+.cutin-txt > * { display: inline-block; transform: skewX(9deg); }
+
+/* The Apu speaks from the other side of the screen in cold stone, so the two
+   voices are never confused even at a glance. */
+.cutin.is-apu {
+  left: auto;
+  right: calc(10px + var(--safe-r));
+  flex-direction: row-reverse;
+  transform: translateX(26px) scale(0.92);
+}
+
+.cutin.is-apu.show { transform: translateX(0) scale(1); }
+
+.cutin.is-apu .cutin-panel {
+  background:
+    radial-gradient(circle at 50% 38%, #7f96ad 0%, #33465c 74%),
+    #1d2836;
+  transform: skewX(9deg);
+}
+
+.cutin.is-apu .cutin-face,
+.cutin.is-apu .cutin-name { transform: skewX(-9deg); }
+
+.cutin.is-apu .cutin-name {
+  background: #cfe0f2;
+  color: #1d2836;
+}
+
+.cutin.is-apu .cutin-txt {
+  transform: skewX(9deg);
+  border-left: 2.5px solid #16202c;
+  border-right: 0;
+  border-radius: 4px 0 0 4px;
+  margin-left: 0;
+  margin-right: -3px;
+  background: linear-gradient(180deg, #eef4fb, #cfdcea);
+  color: #1b2733;
+  font-style: normal;
+}
+
+.cutin.is-apu .cutin-txt > * { transform: skewX(-9deg); }
+
+.cutin.is-apu .cutin-lines { left: auto; right: 0; transform: translateY(-50%) skewX(12deg); }
+
+@media (max-width: 720px) {
+  .cutin { top: calc(64px + var(--safe-t)); }
+  .cutin-panel { width: 50px; height: 50px; }
+  .cutin-txt { max-width: 54vw; padding: 6px 10px; }
+}
+
+/* -------------------------------------------------------- killa portrait */
+
+/* Persistent "she is around" badge. Lives inside .hud, so it fades with the
+   HUD. Parked directly under the pause button: the bottom-left corner looks
+   free but the centered powerup pills grow into it on a phone. */
+
+.killa-portrait {
+  position: absolute;
+  left: calc(15px + var(--safe-l));
+  top: calc(72px + var(--safe-t));
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--killa-rose);
+  background: radial-gradient(circle at 50% 38%,
+    rgba(92, 44, 68, 0.9), rgba(20, 10, 16, 0.92));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 226, 238, 0.16),
+    0 4px 12px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transform: translateY(-8px) scale(0.82);
+  pointer-events: none;
+  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(0.2, 1.1, 0.3, 1);
+}
+
+.killa-portrait.on {
+  opacity: 0.92;
+  transform: translateY(0) scale(1);
+}
+
+.kp-ring {
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1px solid rgba(231, 154, 182, 0.55);
+}
+
+.killa-portrait.on .kp-ring {
+  animation: kp-breathe 2.4s ease-in-out infinite;
+}
+
+.kp-ico {
+  width: 30px;
+  height: 30px;
+  display: block;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+}
+
+@keyframes kp-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(231, 154, 182, 0.35); }
+  55% { box-shadow: 0 0 12px 2px rgba(231, 154, 182, 0.06); }
 }
 
 /* -------------------------------------------------------------- hi-score */
@@ -1212,6 +1709,183 @@ body {
   100% { left: 108%; }
 }
 
+/* ------------------------------------------------- gloat layer (game over) */
+
+/* Bolted onto the existing death panel, not a replacement for it. The
+   .is-gloat class (set on both <body> and #ui so main.js can toggle either)
+   shifts the panel left and clears the right third of the viewport, where
+   the 3D scene stands Killa. Nothing here draws the llama. */
+
+/* Honest death cause, neutral voice, sits under the panel separator. */
+.gloat-cause {
+  display: none;
+  margin: -8px 0 14px;
+  font-size: 0.8rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--parchment-dim);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+.gloat-cause.show {
+  display: block;
+}
+
+/* Her caption, in her colors, deliberately askew against the panel grid. */
+.gloat-quote {
+  display: none;
+  position: relative;
+  margin: 4px 0 18px;
+  padding: 11px 14px 12px 13px;
+  text-align: left;
+  column-gap: 11px;
+  grid-template-columns: 34px 1fr;
+  grid-template-areas:
+    'face name'
+    'face line';
+  align-items: center;
+  border-left: 3px solid var(--killa-rose);
+  border-radius: 4px 13px 13px 4px;
+  background: linear-gradient(102deg,
+    rgba(112, 56, 84, 0.6) 0%,
+    rgba(58, 26, 44, 0.42) 62%,
+    rgba(46, 34, 22, 0.28) 100%);
+  transform: rotate(-0.9deg);
+}
+
+.gloat-quote.show {
+  display: grid;
+  animation: gloat-in 0.5s cubic-bezier(0.2, 1.1, 0.3, 1) 0.22s both;
+}
+
+.gloat-face {
+  grid-area: face;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--killa-rose);
+  background: radial-gradient(circle at 42% 34%,
+    rgba(255, 226, 238, 0.2), rgba(24, 10, 18, 0.6));
+  box-shadow: inset 0 0 0 1px rgba(231, 154, 182, 0.45);
+}
+
+.gloat-ico {
+  width: 26px;
+  height: 26px;
+  display: block;
+}
+
+.gloat-name {
+  grid-area: name;
+  font-size: 0.66rem;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--killa-rose);
+}
+
+.gloat-line {
+  grid-area: line;
+  font-size: clamp(0.95rem, 3.2vw, 1.12rem);
+  font-style: italic;
+  line-height: 1.3;
+  color: #fbe2ec;
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.7);
+}
+
+/* Record variant: she congratulates you in gold, and means none of it. */
+.gloat-quote.is-record {
+  border-left-color: var(--gold);
+  background: linear-gradient(102deg,
+    rgba(120, 84, 24, 0.5) 0%,
+    rgba(70, 46, 14, 0.36) 62%,
+    rgba(46, 34, 22, 0.26) 100%);
+}
+
+.gloat-quote.is-record .gloat-face {
+  color: var(--gold-light);
+  box-shadow: inset 0 0 0 1px rgba(233, 180, 76, 0.5);
+}
+
+.gloat-quote.is-record .gloat-name { color: var(--gold-light); }
+.gloat-quote.is-record .gloat-line { color: var(--parchment); }
+
+@keyframes gloat-in {
+  from { opacity: 0; transform: rotate(-0.9deg) translateX(-14px); }
+  to { opacity: 1; transform: rotate(-0.9deg) translateX(0); }
+}
+
+/* Reserved stage for the 3D Killa. Purely negative space plus a nameplate. */
+.gloat-stage {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 34%;
+  display: none;
+  pointer-events: none;
+}
+
+:is(body, #ui).is-gloat .scr-over .gloat-stage {
+  display: block;
+}
+
+/* Warm floor pool so she does not read as floating on the backdrop. */
+.gloat-stage::before {
+  content: '';
+  position: absolute;
+  left: 6%;
+  right: 6%;
+  bottom: calc(6% + var(--safe-b));
+  height: 26%;
+  background: radial-gradient(60% 100% at 50% 100%,
+    rgba(233, 180, 76, 0.16) 0%, rgba(160, 110, 40, 0.06) 46%, transparent 76%);
+}
+
+.gloat-plate {
+  position: absolute;
+  left: 50%;
+  bottom: calc(22px + var(--safe-b));
+  transform: translateX(-50%);
+  padding: 5px 20px;
+  border-radius: 8px;
+  font-size: 0.72rem;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--killa-rose);
+  background: rgba(20, 10, 16, 0.6);
+  border: 1px solid rgba(231, 154, 182, 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.gloat-plate span {
+  padding-left: 0.3em; /* optically recenter letterspaced caps */
+}
+
+/* Panel steps aside. The blanket backdrop blur is dropped for a left biased
+   scrim so the 3D Killa on the right stays sharp. */
+:is(body, #ui).is-gloat .scr-over {
+  padding-right: calc(34vw + var(--safe-r));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: linear-gradient(90deg,
+    rgba(10, 6, 3, 0.84) 0%,
+    rgba(10, 6, 3, 0.72) 40%,
+    rgba(12, 7, 3, 0.3) 70%,
+    rgba(12, 7, 3, 0.05) 100%);
+}
+
+/* Score UI must never sit on her side of the screen. */
+:is(body, #ui).is-gloat .hud-coins,
+:is(body, #ui).is-gloat .hud-rayo,
+:is(body, #ui).is-gloat .hud-pills {
+  visibility: hidden;
+}
+
 /* ------------------------------------------------------------ responsive */
 
 @media (max-width: 480px) {
@@ -1242,6 +1916,42 @@ body {
 
   .toast {
     top: calc(66px + var(--safe-t));
+  }
+}
+
+@media (max-width: 720px) {
+  /* Killa still gets a stage, just a narrower one, and the panel narrows to
+     match so it never collides with her. */
+  :is(body, #ui).is-gloat .scr-over {
+    padding-right: calc(30vw + var(--safe-r));
+    padding-left: calc(10px + var(--safe-l));
+  }
+
+  :is(body, #ui).is-gloat .scr-over .panel {
+    width: min(64vw, 340px);
+    padding: 24px 18px 20px;
+  }
+
+  .gloat-stage {
+    width: 30%;
+  }
+
+  .gloat-plate {
+    letter-spacing: 0.2em;
+    padding: 4px 12px;
+    font-size: 0.62rem;
+  }
+
+
+  .killa-portrait {
+    width: 44px;
+    height: 44px;
+    top: calc(68px + var(--safe-t));
+  }
+
+  .kp-ico {
+    width: 26px;
+    height: 26px;
   }
 }
 
@@ -1288,8 +1998,21 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .btn-play,
   .boot-chakana,
-  .ribbon::after {
+  .ribbon::after,
+  .killa-portrait.on .kp-ring {
     animation: none;
+  }
+
+  /* Keep the splat as an event but drop the slide and drip motion. The root
+     .splat opacity animation stays: it is what removes the overlay. */
+  .splat-blobs::before,
+  .splat-drip::before {
+    animation: none;
+  }
+
+  .gloat-quote.show {
+    animation-duration: 0.01s;
+    animation-delay: 0s;
   }
 
   .scr-title.is-visible .t-anim {

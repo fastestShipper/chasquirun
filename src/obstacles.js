@@ -38,6 +38,63 @@ export const KIND_INFO = {
 
 const ROLLER_SPEED = 7.5; // m/s toward the player, on top of world speed
 
+// Collapse a static prop into one mesh per material. A camelid is about 20
+// meshes; as a roadside obstacle you pass it at 42 m/s and its idle animation
+// is invisible, so paying 20 draw calls for it is waste. Geometries are only
+// merged when their attribute sets match, and anything unmergeable is kept as
+// is, so this can never silently corrupt a mesh.
+function mergeStatic(root) {
+  root.updateMatrixWorld(true);
+  const byMat = new Map();
+  const keep = [];
+  root.traverse((o) => {
+    if (!o.isMesh || o.isInstancedMesh) return;
+    const g = o.geometry;
+    const a = g && g.attributes;
+    if (!a || !a.position || !a.normal || !a.uv || a.color || g.morphAttributes && Object.keys(g.morphAttributes).length) {
+      keep.push(o);
+      return;
+    }
+    const baked = (g.index ? g.toNonIndexed() : g.clone());
+    baked.applyMatrix4(o.matrixWorld);
+    if (!byMat.has(o.material)) byMat.set(o.material, []);
+    byMat.get(o.material).push(baked);
+  });
+  const out = new THREE.Group();
+  for (const [mat, parts] of byMat) {
+    let geo;
+    if (parts.length === 1) {
+      geo = parts[0];
+    } else {
+      let count = 0;
+      for (const q of parts) count += q.attributes.position.count;
+      const pos = new Float32Array(count * 3);
+      const nor = new Float32Array(count * 3);
+      const uv = new Float32Array(count * 2);
+      let o3 = 0, o2 = 0;
+      for (const q of parts) {
+        pos.set(q.attributes.position.array, o3);
+        nor.set(q.attributes.normal.array, o3);
+        uv.set(q.attributes.uv.array, o2);
+        o3 += q.attributes.position.count * 3;
+        o2 += q.attributes.position.count * 2;
+        q.dispose();
+      }
+      geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    }
+    const m = new THREE.Mesh(geo, mat);
+    m.castShadow = true;
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    out.add(m);
+  }
+  for (const o of keep) out.add(o);
+  return out;
+}
+
 export function createObstacle(kind) {
   const group = new THREE.Group();
   const ob = { kind, group, boxes: [], update: null, action: KIND_INFO[kind].action };
@@ -126,9 +183,19 @@ export function createObstacle(kind) {
     case 'llama': {
       const llama = buildLlama({ sitting: true });
       llama.group.rotation.y = Math.PI * (Math.random() < 0.5 ? 0.06 : -0.06);
-      group.add(llama.group);
-      ob.update = (dt) => llama.update(dt);
-      ob.boxes.push(box3(-0.5, 0.02, -0.68, 0.5, 1.18, 0.68));
+      // Flattened to one mesh per material. A sitting camelid you sprint past
+      // does not need its chewing idle, and 20 draw calls per obstacle was one
+      // of the largest single costs in the frame.
+      group.add(mergeStatic(llama.group));
+      llama.dispose();
+      // Two boxes, not one. A single 1.18 m tall box over the whole footprint
+      // kills the player on empty air beside the neck, because a sitting
+      // camelid is only about 0.7 m high across most of its length and only
+      // the thin neck actually reaches full height. That was tolerable when
+      // llamas were rare decoration; now that they are a common road obstacle
+      // it would read as the game cheating.
+      ob.boxes.push(box3(-0.5, 0.02, -0.68, 0.5, 0.74, 0.68));   // body
+      ob.boxes.push(box3(-0.22, 0.02, -0.60, 0.22, 1.18, -0.16)); // neck and head
       break;
     }
     case 'brazier': {

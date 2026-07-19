@@ -1,0 +1,42 @@
+{
+  "name": "Chasqui Run",
+  "short_name": "Chasqui",
+  "description": "Corre el Qhapaq Nan como chasqui del Inca. Lleva el quipu, esquiva a Killa y entrega el encargo cueste lo que cueste.",
+  "id": "/chasquirun/",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "landscape",
+  "background_color": "#1a1410",
+  "theme_color": "#1a1410",
+  "lang": "es",
+  "dir": "ltr",
+  "categories": ["games"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icons/maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

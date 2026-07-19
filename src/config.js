@@ -10,7 +10,7 @@ export const CONFIG = {
   // Run physics
   baseSpeed: 17.5,          // m/s at start: Olympic-sprinter pace immediately
   maxSpeed: 42,
-  accelRampMeters: 2200,    // distance over which speed ramps to max
+  accelRampMeters: 3400,    // distance over which speed ramps to max
   gravity: -32,
   jumpVel: 11.8,
   slideTime: 0.8,
@@ -25,19 +25,33 @@ export const CONFIG = {
   chakanaValue: 25,
   magnetRadius: 6.5,
   powerupDuration: { inti: 999, wayra: 5.5, quri: 8.0 }, // inti lasts until used
-  nitro: { duration: 2.4, cooldown: 20, boost: 0.55 },   // Shift: +55% speed, invulnerable
+  // Shift: the sun god's sprint. Duration raised from 2.4 s, which ended
+  // before the player had finished enjoying it; the cooldown grows with it so
+  // the uptime ratio stays roughly where it was.
+  intiRay: { duration: 4.6, cooldown: 22, boost: 0.55 },
   powerupEveryMeters: [340, 520],
   chakanaEveryMeters: [380, 640],
 
   // Difficulty: obstacle action slots per chunk gated by tier
+  // Killa carries a growing share of the threat from 300 m on, so static
+  // density is thinned in the EARLY band only (0 to 700 m), where the game was
+  // already easy. Late-game slots are untouched: cutting density at 2400 m+ is
+  // how a runner quietly loses its best players while the funnel still looks
+  // fine. Actions per 100 m stays roughly constant, it just changes author.
+  // The ramp is deliberately long. Three separate pressures now stack on the
+  // player at once: static obstacles, rollers, and Killa's interventions from
+  // 420 m. Tuned against static density alone, the combined curve spiked hard
+  // enough that even a competent player was overwhelmed before 1 km, which
+  // reads as unfair rather than difficult. Slots are the sharpest knob (a slot
+  // is a required action inside a 36 m chunk), so they move last and slowest.
   difficulty: [
-    { atMeters: 0,    slots: 1, movers: false, rollerChance: 0 },
-    { atMeters: 250,  slots: 2, movers: false, rollerChance: 0 },
-    { atMeters: 700,  slots: 2, movers: true,  rollerChance: 0.14 },
-    { atMeters: 1400, slots: 3, movers: true,  rollerChance: 0.18 },
-    { atMeters: 2400, slots: 3, movers: true,  rollerChance: 0.28 },
-    { atMeters: 4000, slots: 3, movers: true,  rollerChance: 0.34 },
-    { atMeters: 7000, slots: 3, movers: true,  rollerChance: 0.42 },
+    { atMeters: 0,     slots: 1, movers: false, rollerChance: 0 },
+    { atMeters: 400,   slots: 1, movers: false, rollerChance: 0 },
+    { atMeters: 1000,  slots: 2, movers: true,  rollerChance: 0.10 },
+    { atMeters: 2200,  slots: 2, movers: true,  rollerChance: 0.15 },
+    { atMeters: 3600,  slots: 2, movers: true,  rollerChance: 0.20 },
+    { atMeters: 5200,  slots: 3, movers: true,  rollerChance: 0.26 },
+    { atMeters: 8000,  slots: 3, movers: true,  rollerChance: 0.34 },
   ],
 
   // Biomes cycle in this order; lengths in chunks

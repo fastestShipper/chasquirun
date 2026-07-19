@@ -27,6 +27,9 @@ import { AudioSys } from './audio/engine.js';
 import { Scores } from './scores.js';
 import { loadModels } from './assets.js';
 import { setEnv as setTerrainEnv, setWorldOrigin as setTerrainOrigin } from './terrain.js';
+import { buildKilla } from './animals.js';
+import { Nemesis } from './nemesis.js';
+import { IntiStrike } from './intistrike.js';
 
 const STATE = { MENU: 0, COUNTDOWN: 1, RUN: 2, PAUSED: 3, DEAD: 4 };
 
@@ -72,6 +75,10 @@ async function boot() {
   await loadPhotoTextures();
   setBoot('Cargando modelos 3D...');
   await loadModels();
+  // Recorded SFX. Never rejects, and the synthesized patches cover every sound
+  // until (or if) the buffers land, so this can never block or break boot.
+  setBoot('Afinando los sonidos...');
+  await AudioSys.preloadSamples();
 
   // ---- World systems ----
   setBoot('Pintando el cielo de los Andes...');
@@ -133,9 +140,11 @@ async function boot() {
   const player = new Player(chasqui);
   const rig = new CameraRig(camera);
 
+
   // ---- Post ----
   let composer = null;
   let bloomPass = null;
+  let gradePass = null;   // null on the low tier: no composer, no grade pass
   if (Q.bloom) {
     // Explicit MSAA target: the composer default has samples:0 and would
     // silently drop the canvas antialiasing.
@@ -168,11 +177,18 @@ async function boot() {
     composer.addPass(bloomPass);
     // Final grade: gentle vignette + split toning (cool shadows, warm
     // highlights) + a whisper of saturation. One cheap full-screen pass.
-    const gradePass = new ShaderPass({
+    gradePass = new ShaderPass({
       name: 'GradeShader',
       uniforms: {
         tDiffuse: { value: null },
         uVig: { value: 0.22 },
+        // Speed feel. uBoost 0..1 is the eased Rayo curve, uHit is a decaying
+        // impact impulse. Both drive screen-space effects that cost one pass
+        // and no extra render targets, which is why they live here rather than
+        // as separate passes.
+        uBoost: { value: 0 },
+        uHit: { value: 0 },
+        uAber: { value: 0 },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -183,16 +199,62 @@ async function boot() {
       fragmentShader: `
         uniform sampler2D tDiffuse;
         uniform float uVig;
+        uniform float uBoost;
+        uniform float uHit;
+        uniform float uAber;
         varying vec2 vUv;
+
         void main() {
-          vec4 color = texture2D(tDiffuse, vUv);
-          float d = distance(vUv, vec2(0.5));
-          color.rgb *= 1.0 - uVig * smoothstep(0.34, 0.86, d);
+          vec2 uv = vUv;
+          vec2 toC = uv - 0.5;
+          float d = length(toC);
+
+          // Impact punch: a brief radial squeeze of the whole image. Reads as
+          // the shockwave hitting the camera itself.
+          uv -= toC * uHit * 0.06 * smoothstep(0.0, 0.9, d);
+
+          // Radial speed blur while boosting. Samples march back along the
+          // vector to the centre, so the world streaks outward past you and
+          // the middle of the screen stays readable, which matters because the
+          // player still has to see the road.
+          float amt = uBoost * 0.055 + uHit * 0.05;
+          vec4 color = vec4(0.0);
+          if (amt > 0.001) {
+            float w = 0.0;
+            for (int i = 0; i < 8; i++) {
+              float t = float(i) / 7.0;
+              // Weight the streak by distance from centre: none in the middle,
+              // strong at the edges.
+              vec2 su = uv - toC * t * amt * smoothstep(0.10, 0.75, d);
+              float wt = 1.0 - t * 0.65;
+              color += texture2D(tDiffuse, su) * wt;
+              w += wt;
+            }
+            color /= w;
+          } else {
+            color = texture2D(tDiffuse, uv);
+          }
+
+          // Chromatic aberration, scaled by radius so the centre stays clean.
+          float ab = (uAber + uBoost * 0.35 + uHit * 0.6) * 0.0032;
+          if (ab > 0.00001) {
+            vec2 off = toC * ab * smoothstep(0.06, 0.9, d);
+            color.r = texture2D(tDiffuse, uv + off).r;
+            color.b = texture2D(tDiffuse, uv - off).b;
+          }
+
+          // Vignette tightens while boosting: tunnel vision under power.
+          float vig = uVig + uBoost * 0.16 + uHit * 0.10;
+          color.rgb *= 1.0 - vig * smoothstep(0.34, 0.86, d);
+
           float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
           vec3 tint = mix(vec3(0.94, 0.98, 1.05), vec3(1.045, 1.0, 0.95),
                           smoothstep(0.18, 0.72, lum));
           color.rgb *= tint;
           color.rgb = mix(vec3(lum), color.rgb, 1.06);
+
+          // Inti's warmth washes the frame while the blessing is on.
+          color.rgb += vec3(0.16, 0.10, 0.02) * uBoost * (0.35 + d);
           gl_FragColor = color;
         }`,
     });
@@ -212,9 +274,10 @@ async function boot() {
     wayraT: 0,
     quriT: 0,
     boost: 0,
-    nitroT: 0,
-    nitroCd: 0,
-    nitroBoost: 0,
+    intiRayT: 0,
+    intiRayCd: 0,
+    intiRayBoost: 0,
+    roadPhase: { a: 0, b: 2, c: 0, d: 1, e: 0, f: 0 },
     timeScale: 1,
     deathT: 0,
     gameOverShown: false,
@@ -240,7 +303,7 @@ async function boot() {
     onRestart: () => { click(); hideAllPanels(); startRun(); },
     onMenu: () => { click(); toMenu(); },
     onPause: () => { click(); pauseGame(); },
-    onNitro: () => fireNitro(),
+    onIntiRay: () => fireIntiRay(),
     onMute: (m) => { AudioSys.setMuted(m); Save.muted = m; click(); },
     onQuality: (q) => {
       click();
@@ -298,7 +361,7 @@ async function boot() {
   player.onCrash = (ob) => {
     // Invulnerable through the boosts AND their eased decay tails: the speed
     // is still super-human for ~0.3 s after the timers expire.
-    if (G.wayraT > 0 || G.nitroT > 0 || G.boost > 0.25 || G.nitroBoost > 0.25) return;
+    if (G.wayraT > 0 || G.intiRayT > 0 || G.boost > 0.25 || G.intiRayBoost > 0.25) return;
     if (ob && ob.kind === 'llama') AudioSys.play('llama');
     if (G.shield) {
       G.shield = false;
@@ -318,6 +381,8 @@ async function boot() {
     rig.shake(CONFIG.cameraShakeCrash);
     AudioSys.play('crash');
     AudioSys.stopMusic(0.5);
+    punch(0.85);
+    herdLaugh();
     ui.flashDamage();
     ui.hideHUD();
     _fxV.set(player.x, 1.0, 0);
@@ -329,8 +394,96 @@ async function boot() {
     rig.setMode('dead');
     AudioSys.play('fall');
     AudioSys.stopMusic(0.5);
+    herdLaugh();
     ui.hideHUD();
   };
+
+
+  // ---- Killa, the nemesis ----
+  const killa = buildKilla();
+  const intiStrike = new IntiStrike(scene);
+  // Parented to the scene (player space) rather than worldGroup, so chunk
+  // recycling can never touch her. Hooks keep nemesis.js free of direct
+  // dependencies on audio, particles and the UI.
+  const nemesis = new Nemesis(scene, killa, {
+    spit: () => AudioSys.play('killaSpit'),
+    chuckle: () => AudioSys.play('killaChuckle'),
+    taunt: (v) => AudioSys.play('killaTaunt', { variation: v }),
+    orgle: () => AudioSys.play('killaOrgle'),
+    stamp: () => AudioSys.play('killaStamp'),
+    panic: () => AudioSys.play('killaPanic'),
+    sting: () => AudioSys.killaSting && AudioSys.killaSting(),
+    splatter: (side) => ui.splatter(side),
+    toast: (txt) => ui.killaToast(txt),
+    portrait: (on) => ui.killaPortrait && ui.killaPortrait(on),
+    // Reading her lunge and not being there is a real save; make it feel like
+    // one rather than a non-event.
+    dodged: () => {
+      AudioSys.play('powerup', { vol: 0.5 });
+      ui.flashGold();
+      rig.shake(0.12);
+    },
+    stealQipi: () => {
+      // The bundle leaves his back and rides her. Coins stop banking while she
+      // has it: the delivery is the job, so nothing else counts until it is
+      // back. That is a real cost with zero risk of an unfair death.
+      chasqui.setQipiVisible(false);
+      G.qipiLost = true;
+      G.combo = 0;
+      rig.shake(0.32);
+      ui.flashDamage();
+      AudioSys.play('crash', { vol: 0.45 });
+    },
+    returnQipi: (caught) => {
+      chasqui.setQipiVisible(true);
+      G.qipiLost = false;
+      if (caught) {
+        AudioSys.play('powerup');
+        ui.flashGold();
+        _fxV.set(player.x, 1.2, 0);
+        particles.burst(_fxV, 0xffd76a, 34);
+      }
+    },
+    armed: (on) => {
+      G.pututuArmed = on;
+      // The mountain tells you what you can do. She only ever tells you what
+      // you failed to do.
+      if (on) ui.apuToast('El pututu ha despertado. Invocalo con Shift.');
+    },
+    // She robs the run, never the life. Coins, combo, tempo and charge are
+    // hers to take; survival is not.
+    steal: (n) => {
+      const got = Math.min(n * CONFIG.coinValue, G.runCoins);
+      G.runCoins -= got;
+      G.combo = 0;
+      ui.flashDamage();
+      return got;
+    },
+    siphon: () => {
+      // Half the banked Rayo charge, never a full reset.
+      if (G.intiRayCd <= 0) {
+        G.intiRayCd = (CONFIG.intiRay.duration + CONFIG.intiRay.cooldown) * 0.5;
+      } else {
+        G.intiRayCd = Math.min(
+          CONFIG.intiRay.duration + CONFIG.intiRay.cooldown,
+          G.intiRayCd + 6
+        );
+      }
+    },
+    headbutt: (dir) => {
+      // The shove: lose the lane, the combo and a slice of the purse. Never
+      // a death state, no matter the speed.
+      player.laneIdx = clamp(player.laneIdx + dir, 0, CONFIG.lanes.length - 1);
+      G.combo = 0;
+      G.runCoins = Math.max(0, Math.round(G.runCoins * 0.85));
+      G.timeScale = 0.82;
+      rig.shake(0.3);
+      AudioSys.play('crash', { vol: 0.5 });
+      ui.flashDamage();
+      _fxV.set(player.x, 1.0, 0);
+      particles.dust(_fxV, 12);
+    },
+  });
 
   // ---- Biome events ----
   let splashDone = false;
@@ -351,6 +504,55 @@ async function boot() {
   };
 
   // ---- State transitions ----
+  // Gameplay reminders. Two schedules, and the wording follows the actual
+  // input the player has: telling a phone user to press Shift is worse than
+  // saying nothing. BASICS stop hard at 200 m, past which a tip is just noise.
+  // KILLA tips fire once, when she first appears and the rules change.
+  const TIP_LIMIT = 200;
+  const TIPS_TOUCH = [
+    'Desliza izquierda o derecha para cambiar de carril',
+    'Desliza arriba para saltar, abajo para deslizarte',
+    'Toca el boton RAYO para invocar al sol',
+    'Recoge soles sin romper la racha',
+  ];
+  const TIPS_KEYS = [
+    'Flechas o WASD para cambiar de carril',
+    'Arriba para saltar, abajo para deslizarte',
+    'Shift: invoca el Rayo de Inti',
+    'Recoge soles sin romper la racha',
+  ];
+  const TIP_AT = [18, 62, 118, 168];
+  const tipText = isMobile ? TIPS_TOUCH : TIPS_KEYS;
+  const basicTips = TIP_AT.map((at, i) => ({ at, said: false, text: tipText[i] }));
+  const killaTipText = [
+    'Killa quiere tu encomienda, no tus soles',
+    'Cuando te mire fijo, va a atacar un carril',
+    isMobile
+      ? 'Lee el carril y deslizate a otro: fallara'
+      : 'Lee el carril y cambiate a otro: fallara',
+  ];
+  const killaTips = [0, 4.5, 9].map((after, i) => ({ after, said: false, text: killaTipText[i] }));
+  let killaSeen = false;
+  let killaTipT = 0;
+  function resetTips() {
+    for (const t of basicTips) t.said = false;
+    for (const t of killaTips) t.said = false;
+    killaSeen = false;
+    killaTipT = 0;
+    ui.tip(null);
+  }
+
+  // The Apu's guidance beats. Distance-gated, fired once per run, and always
+  // about something the player can act on right now.
+  const apuBeats = [
+    { at: 3, said: false, line: 'Lleva el quipu al Inca. Cueste lo que cueste.' },
+    { at: 60, said: false, line: isMobile
+      ? 'Pide ayuda al sol cuando necesites correr.'
+      : 'Pide ayuda al sol cuando necesites correr. Shift.' },
+    { at: 1500, said: false, line: 'El camino se estrecha. Manten el paso, chasqui.' },
+  ];
+  function resetApuBeats() { for (const b of apuBeats) b.said = false; }
+
   function startRun() {
     track.reset();
     player.reset();
@@ -363,12 +565,25 @@ async function boot() {
     G.wayraT = 0;
     G.quriT = 0;
     G.boost = 0;
-    G.nitroT = 0;
-    G.nitroCd = 0;
-    G.nitroBoost = 0;
+    G.intiRayT = 0;
+    G.intiRayCd = 0;
+    G.intiRayBoost = 0;
     G.timeScale = 1;
     G.gameOverShown = false;
     G.isRecord = false;
+    G.killaLine = '';
+    G.qipiLost = false;
+    // Re-roll the road's character so a repeated route never feels repeated.
+    G.roadPhase.a = Math.random() * 6.283;
+    G.roadPhase.b = Math.random() * 6.283;
+    G.roadPhase.c = Math.random() * 6.283;
+    G.roadPhase.d = Math.random() * 6.283;
+    G.roadPhase.e = Math.random() * 6.283;
+    G.roadPhase.f = Math.random() * 6.283;
+    resetApuBeats();
+    resetTips();
+    chasqui.setQipiVisible(true);
+    nemesis.reset((Math.random() * 0xffffffff) >>> 0);
     splashDone = false;
     hideAllPanels();
     ui.hideHUD(); // no stale previous-run stats behind the countdown
@@ -405,6 +620,7 @@ async function boot() {
   }
 
   function toMenu() {
+    nemesis.park();
     hideAllPanels();
     ui.hideHUD();
     track.reset();
@@ -424,6 +640,20 @@ async function boot() {
     }
   }
 
+  // Every llama on the road gets to enjoy this. Staggered starts and distinct
+  // variation seeds so it reads as a herd reacting, not one sound retriggered.
+  function herdLaugh() {
+    const n = 3 + ((Math.random() * 3) | 0);
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => {
+        AudioSys.play('killaChuckle', {
+          variation: Math.random(),
+          vol: 0.3 + Math.random() * 0.3,
+        });
+      }, 140 + i * (90 + Math.random() * 150));
+    }
+  }
+
   function finishRun() {
     const best = Save.best;
     const d = Math.floor(G.dist);
@@ -432,7 +662,22 @@ async function boot() {
     Save.coins = Save.coins + G.runCoins;
     AudioSys.play('gameOver');
     if (G.isRecord) AudioSys.play('record');
-    ui.showGameOver({ dist: d, coins: G.runCoins, best: Math.max(best, d), isRecord: G.isRecord });
+
+    // Killa stages the death screen. She takes credit for kills she did not
+    // commit (any death within 2.5 s of an intervention reads as hers), which
+    // makes her feel lethal while staying provably non-lethal in code. The
+    // cause line stays honest so the player is never actually lied to.
+    const line = nemesis.gloat(player.deathCause, G.isRecord);
+    G.killaLine = line;
+    ui.showGameOver({
+      dist: d, coins: G.runCoins, best: Math.max(best, d), isRecord: G.isRecord,
+    });
+    if (ui.showGloat) {
+      ui.showGloat({
+        dist: d, coins: G.runCoins, isRecord: G.isRecord,
+        cause: nemesis.causeLine(player.deathCause), line,
+      });
+    }
 
     // Arcade hi-score: shared global board; 4-letter tag when you make it.
     Scores.top().then(({ scores, source }) => {
@@ -470,21 +715,39 @@ async function boot() {
       if (player.laneIdx !== before) AudioSys.play('whoosh', { vol: 0.4 });
     } else if (action === 'jump') player.jump();
     else if (action === 'slide') player.slide();
-    else if (action === 'nitro') fireNitro();
+    else if (action === 'intiRay') fireIntiRay();
   });
 
   // ---- Resize ----
-  addEventListener('resize', () => {
+  // Render scale, driven by measured frame time. Phones vary enormously and a
+  // fixed pixel ratio either wastes a good device or drowns a weak one, so the
+  // resolution adapts instead. Only ever scales DOWN from the tier cap.
+  let renderScale = 1;
+  const MIN_SCALE = isMobile ? 0.62 : 0.75;
+
+  function applySize() {
+    const cap = Math.min(devicePixelRatio || 1, Q.pixelRatioCap) * renderScale;
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
-    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, Q.pixelRatioCap));
+    renderer.setPixelRatio(cap);
     renderer.setSize(innerWidth, innerHeight);
     syncParticleScale();
     if (composer) {
-      composer.setPixelRatio(Math.min(devicePixelRatio || 1, Q.pixelRatioCap));
+      composer.setPixelRatio(cap);
       composer.setSize(innerWidth, innerHeight);
     }
-  });
+  }
+
+  // Debounced: iOS fires resize continuously while the URL bar slides, and
+  // reallocating the render targets on every one of those events is a far
+  // bigger stall than the resize itself.
+  let resizeTimer = 0;
+  const onResize = () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(applySize, 120);
+  };
+  addEventListener('resize', onResize);
+  addEventListener('orientationchange', onResize);
 
   let countdownInterrupted = false;
   document.addEventListener('visibilitychange', () => {
@@ -505,10 +768,20 @@ async function boot() {
     }
   });
 
-  // ---- HUD scratch ----
+  // ---- Scratch ----
+  // Reused every frame; the nemesis update must never allocate.
+  const nemesisCtx = {
+    dist: 0, speed: 0, state: 0, playerX: 0, playerLane: 1,
+    grounded: true, sliding: false, nitroT: 0, nearGap: false, track: null,
+  };
   const hudPowerups = [];
-  const hudNitro = { state: 'ready', t01: 1 };
-  const hudData = { dist: 0, coins: 0, mult: 1, powerups: hudPowerups, nitro: hudNitro };
+  const hudIntiRay = { state: 'ready', t01: 1 };
+  let rayoWasCooling = false;
+  // Screen impact impulse. Set to 1 by big events and decays every frame; the
+  // grade pass turns it into a radial squeeze, aberration and vignette pulse.
+  let screenHit = 0;
+  const punch = (v) => { screenHit = Math.max(screenHit, v); };
+  const hudData = { dist: 0, coins: 0, mult: 1, powerups: hudPowerups, intiRay: hudIntiRay };
 
   // ---- Main loop ----
   const clock = new THREE.Clock();
@@ -517,25 +790,73 @@ async function boot() {
   function speedNow() {
     const t = clamp(G.dist / CONFIG.accelRampMeters, 0, 1);
     let s = lerp(CONFIG.baseSpeed, CONFIG.maxSpeed, Math.pow(t, 0.8));
-    // Wayra and nitro, both eased so speed never steps in a single frame.
-    s *= 1 + 0.35 * G.boost + CONFIG.nitro.boost * G.nitroBoost;
+    // Wayra and intiRay, both eased so speed never steps in a single frame.
+    s *= 1 + 0.35 * G.boost + CONFIG.intiRay.boost * G.intiRayBoost;
     return s;
   }
 
-  function fireNitro() {
-    if (G.state !== STATE.RUN || player.dead || G.nitroCd > 0) return;
-    G.nitroT = CONFIG.nitro.duration;
-    G.nitroCd = CONFIG.nitro.duration + CONFIG.nitro.cooldown;
-    AudioSys.play('gust');
-    AudioSys.play('whoosh', { vol: 0.7 });
+  function fireIntiRay() {
+    if (G.state !== STATE.RUN || player.dead) return;
+    // An armed pututu takes priority over the dash. This is the revenge beat:
+    // Killa panics, trips, and coughs up everything she stole from this run.
+    if (nemesis.armed) {
+      const payout = nemesis.blastPututu();
+      AudioSys.play('pututu');
+      G.runCoins += payout;
+      G.timeScale = 0.45;
+      rig.shake(0.35);
+      _fxV.set(player.x, 1.2, 0);
+      particles.burst(_fxV, 0xffd76a, 46);
+      ui.flashGold();
+      return;
+    }
+    if (G.intiRayCd > 0) return;
+    G.intiRayT = CONFIG.intiRay.duration;
+    G.intiRayCd = CONFIG.intiRay.duration + CONFIG.intiRay.cooldown;
+    // The sun god actually arrives: a bolt out of the sky, a shockwave on the
+    // ground, and a sound built for the moment instead of a recycled whoosh.
+    AudioSys.play('intiStrike');
+    AudioSys.duckMusic(0.6);   // the mix gets out of the way for the god
+    intiStrike.strike();
+    punch(1);
     _fxV.set(player.x, 1.1, 0);
-    particles.burst(_fxV, 0x9df2ff, 26);
-    rig.shake(0.14);
+    particles.burst(_fxV, 0xffc247, 44);
+    rig.shake(0.42);
+    G.timeScale = 0.55;   // brief hitch so the strike lands with weight
+    ui.flashGold();
+  }
+
+  let perfAccum = 0;
+  let perfFrames = 0;
+  let perfCooldown = 0;
+
+  // Adapt the render scale to the device. Measured over a whole second so one
+  // hitch (a chunk build, a GC pause) can never trigger a resolution change.
+  function adaptPerf(dtRaw) {
+    if (G.state !== STATE.RUN) return;
+    if (perfCooldown > 0) { perfCooldown -= dtRaw; return; }
+    perfAccum += dtRaw;
+    perfFrames++;
+    if (perfAccum < 1) return;
+    const avg = perfAccum / perfFrames;
+    perfAccum = 0;
+    perfFrames = 0;
+    // Below ~45 fps: drop resolution. Comfortably above 58: give it back.
+    if (avg > 0.0222 && renderScale > MIN_SCALE) {
+      renderScale = Math.max(MIN_SCALE, renderScale - 0.1);
+      applySize();
+      perfCooldown = 2.5;
+    } else if (avg < 0.0166 && renderScale < 1) {
+      renderScale = Math.min(1, renderScale + 0.05);
+      applySize();
+      perfCooldown = 4;
+    }
   }
 
   function frame() {
     requestAnimationFrame(frame);
     const dtRaw = Math.min(clock.getDelta(), 0.05);
+    adaptPerf(dtRaw);
     if (G.state === STATE.PAUSED) {
       renderFrame();
       return;
@@ -552,12 +873,27 @@ async function boot() {
     // into long lateral curves, crests and dips as distance advances. The
     // mountains stay unbent, anchoring the horizon, so the road reads as
     // winding THROUGH the landscape. Purely visual: physics never changes.
-    const swp = Math.sin(G.dist * 0.0021) * 0.7 + Math.sin(G.dist * 0.00057 + 2.0) * 0.3;
-    Curve.uniforms.uCurveX.value = swp * 2.4e-4;
-    Curve.uniforms.uCurveY.value = -1.15e-4 + Math.sin(G.dist * 0.0013 + 1.0) * 5.5e-5;
+    // Andean roads are not graded highways: they roll, crest, dip and bank.
+    // Three octaves per axis with per-run phase offsets, so the SAME chunk
+    // geometry reads as a different stretch of mountain on every run. This is
+    // purely a vertex bend; physics, lanes and collision never move, which is
+    // why it can be this aggressive without ever being unfair.
+    const ph = G.roadPhase;
+    const swp =
+      Math.sin(G.dist * 0.0021 + ph.a) * 0.62 +
+      Math.sin(G.dist * 0.00057 + ph.b) * 0.30 +
+      Math.sin(G.dist * 0.0049 + ph.c) * 0.14;
+    // Vertical: a long swell, a medium roll, and a short chop that reads as
+    // the road actually being broken up underfoot.
+    const rise =
+      Math.sin(G.dist * 0.0013 + ph.d) * 6.2e-5 +
+      Math.sin(G.dist * 0.0037 + ph.e) * 3.1e-5 +
+      Math.sin(G.dist * 0.0092 + ph.f) * 1.5e-5;
+    Curve.uniforms.uCurveX.value = swp * 2.9e-4;
+    Curve.uniforms.uCurveY.value = -1.15e-4 + rise;
 
     G.boost = damp(G.boost, G.state === STATE.RUN && G.wayraT > 0 ? 1 : 0, 6, dtRaw);
-    G.nitroBoost = damp(G.nitroBoost, G.state === STATE.RUN && G.nitroT > 0 ? 1 : 0, 8, dtRaw);
+    G.intiRayBoost = damp(G.intiRayBoost, G.state === STATE.RUN && G.intiRayT > 0 ? 1 : 0, 8, dtRaw);
     const speed = G.state === STATE.RUN ? speedNow() : 0;
     const speed01 = clamp((speed - CONFIG.baseSpeed) / (CONFIG.maxSpeed - CONFIG.baseSpeed), 0, 1);
 
@@ -572,13 +908,41 @@ async function boot() {
       player.update(dt, track, frameTravel);
       player.checkCollisions(track, frameTravel);
 
+      // Killa runs AFTER the track (so worldGroup z is current) and AFTER the
+      // player (so she reads settled state). Her collider is her own; it never
+      // goes near track.getColliders().
+      nemesisCtx.dist = G.dist;
+      nemesisCtx.speed = speed;
+      nemesisCtx.state = G.state;
+      nemesisCtx.playerX = player.x;
+      nemesisCtx.playerLane = player.laneIdx;
+      nemesisCtx.grounded = player.grounded;
+      nemesisCtx.sliding = player.sliding;
+      nemesisCtx.nitroT = G.intiRayT;
+      nemesisCtx.nearGap = !track.isGroundSolid(player.x, 34);
+      nemesisCtx.track = track;
+      nemesis.update(dt, nemesisCtx);
+      // Ramming her at speed is a humiliation, not a crash: she throws a
+      // three stage tantrum and the player pays nothing.
+      if (nemesis.hasQipi) {
+        // The chase: touching her at all wins the bundle back, Rayo or not.
+        if (nemesis.overlapsPlayer(player)) nemesis.dropQipi(false);
+      } else if (G.intiRayT > 0 || G.intiRayBoost > 0.5) {
+        if (nemesis.overlapsPlayer(player)) nemesis.nitroRam();
+      } else {
+        nemesis.collide(player);
+      }
+
       // Coins.
       const magnetOn = G.quriT > 0;
       const got = track.coins.update(dt, playerPos, magnetOn, speed * dt * 0.5);
       for (const c of got) {
         G.combo++;
         G.comboT = 1.2;
-        G.runCoins += CONFIG.coinValue * (G.wayraT > 0 ? 2 : 1);
+        // No encomienda, no delivery, no pay. Coins still collect visually so
+        // the road does not feel dead, they just do not bank until she gives
+        // the bundle back.
+        if (!G.qipiLost) G.runCoins += CONFIG.coinValue * (G.wayraT > 0 ? 2 : 1);
         AudioSys.play('coin', { combo: G.combo });
         _fxV.set(c.x, c.y, c.z);
         particles.sparkle(_fxV, 0xffd76a);
@@ -609,10 +973,30 @@ async function boot() {
           particles.burst(_fxV, 0xc79bff, 22);
         }
       }
+      if (G.dist < TIP_LIMIT) {
+        for (let i = 0; i < basicTips.length; i++) {
+          const t = basicTips[i];
+          if (!t.said && G.dist >= t.at) { t.said = true; ui.tip(t.text); break; }
+        }
+      }
+      if (!killaSeen && killa.group.visible) killaSeen = true;
+      if (killaSeen) {
+        killaTipT += dt;
+        for (let i = 0; i < killaTips.length; i++) {
+          const t = killaTips[i];
+          if (!t.said && killaTipT >= t.after) { t.said = true; ui.tip(t.text, 3400); break; }
+        }
+      }
+
+      for (let i = 0; i < apuBeats.length; i++) {
+        const b = apuBeats[i];
+        if (!b.said && G.dist >= b.at) { b.said = true; ui.apuToast(b.line); }
+      }
+
       if (G.wayraT > 0) G.wayraT -= dt;
       if (G.quriT > 0) G.quriT -= dt;
-      if (G.nitroT > 0) G.nitroT -= dt;
-      if (G.nitroCd > 0) G.nitroCd -= dt;
+      if (G.intiRayT > 0) G.intiRayT -= dt;
+      if (G.intiRayCd > 0) G.intiRayCd -= dt;
 
       // Permanent crystal sierra daytime; the cycle is retired by request.
 
@@ -624,21 +1008,36 @@ async function boot() {
       hudData.dist = Math.floor(G.dist);
       hudData.coins = G.runCoins;
       hudData.mult = G.wayraT > 0 ? 2 : 1;
-      if (G.nitroT > 0) {
-        hudNitro.state = 'active';
-        hudNitro.t01 = G.nitroT / CONFIG.nitro.duration;
-      } else if (G.nitroCd > 0) {
-        hudNitro.state = 'cooldown';
-        hudNitro.t01 = 1 - G.nitroCd / (CONFIG.nitro.duration + CONFIG.nitro.cooldown);
+      if (G.intiRayT > 0) {
+        hudIntiRay.state = 'active';
+        hudIntiRay.t01 = G.intiRayT / CONFIG.intiRay.duration;
+      } else if (G.intiRayCd > 0) {
+        rayoWasCooling = true;
+        hudIntiRay.state = 'cooldown';
+        hudIntiRay.t01 = 1 - G.intiRayCd / (CONFIG.intiRay.duration + CONFIG.intiRay.cooldown);
       } else {
-        hudNitro.state = 'ready';
-        hudNitro.t01 = 1;
+        // The moment it comes back. Easy to miss mid-run, so it gets both a
+        // sound and a visible pulse rather than silently becoming available.
+        if (rayoWasCooling) {
+          rayoWasCooling = false;
+          AudioSys.play('powerup', { vol: 0.55 });
+          if (ui.rayoReady) ui.rayoReady();
+        }
+        hudIntiRay.state = 'ready';
+        hudIntiRay.t01 = 1;
       }
-      hudData.nitro = hudNitro;
+      hudData.intiRay = hudIntiRay;
       ui.updateHUD(hudData);
     } else if (G.state === STATE.DEAD) {
       track.update(dt, 0); // world halts, ambient anims continue
       player.update(dt, track);
+      // She keeps animating through the death screen: the gloat IS the beat.
+      nemesisCtx.dist = G.dist;
+      nemesisCtx.speed = 0;
+      nemesisCtx.state = G.state;
+      nemesisCtx.playerX = player.x;
+      nemesisCtx.track = track;
+      nemesis.update(dtRaw, nemesisCtx);
       G.deathT += dtRaw;
       if (player.deathCause === 'fall' && !splashDone && player.y < -24 && track.currentBiome === 'BRIDGE') {
         splashDone = true;
@@ -667,6 +1066,24 @@ async function boot() {
     else if (player.sliding) charState.mode = 'slide';
     else charState.mode = 'run';
     chasqui.update(dt, charState);
+    // Inti's blessing rides the same eased curve as the speed boost.
+    chasqui.setIntiGlow(G.intiRayBoost);
+    intiStrike.setGlow(G.intiRayBoost);
+    intiStrike.update(dtRaw, player.x, player.y);
+
+    screenHit = Math.max(0, screenHit - dtRaw * 3.4);
+    if (gradePass) {
+      gradePass.uniforms.uBoost.value = G.intiRayBoost;
+      gradePass.uniforms.uHit.value = screenHit * screenHit;
+    }
+    // FOV kick. The camera itself has to react or the screen effects are just
+    // decoration bolted onto a static lens.
+    const fovWant = CONFIG.fov.base
+      + (CONFIG.fov.max - CONFIG.fov.base) * (speed01 * 0.55 + G.intiRayBoost * 0.45);
+    if (Math.abs(camera.fov - fovWant) > 0.01) {
+      camera.fov = damp(camera.fov, fovWant, 4.5, dtRaw);
+      camera.updateProjectionMatrix();
+    }
 
     // Atmosphere.
     sky.update(dtRaw, camera, G.dist);
@@ -698,7 +1115,7 @@ async function boot() {
   }
 
   // Hidden debug handle (harmless in production, used by tests).
-  window.__cq = { G, player, track, sky, AudioSys, startRun, renderer };
+  window.__cq = { G, player, track, sky, AudioSys, startRun, renderer, nemesis, killa };
 
   // ---- Go ----
   setBoot('Listo.');

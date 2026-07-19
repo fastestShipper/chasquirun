@@ -625,6 +625,93 @@ function boulderGeometry(rnd, scale) {
 // buildTerraces: the iconic andenes
 // ---------------------------------------------------------------------------
 
+// The andenes have to TILE. Chunk geometry is baked once and reused at many
+// world z, so every terrace bank in the game shares ONE cross-section profile,
+// computed here from a fixed seed. Randomising tier height, depth or front
+// line per CALL (which is what this used to do) puts chunk N's tier 3 at a
+// different x and y from chunk N+1's, and that step is exactly the hole you
+// could see through at every 36 m seam. Variety comes from tier COUNT, from
+// where track.js places the bank, and from the scattered tufts, none of which
+// ever has to meet a neighbouring chunk.
+const TERRACE_MAX_TIERS = 8;
+let _terraceProfile = null;
+function terraceProfile() {
+  if (_terraceProfile) return _terraceProfile;
+  const rnd = mulberry32(0x7e44ace);
+  const p = [];
+  let baseY = 0;
+  let inner = 4.6; // first wall face, safely outside the run corridor
+  for (let i = 0; i < TERRACE_MAX_TIERS; i++) {
+    const h = 0.95 + rnd() * 0.45;
+    const depth = 2.5 + rnd() * 1.5;
+    const wx = inner + (rnd() - 0.5) * 0.24; // per-tier front-line stagger
+    p.push({ h, depth, wx, baseY });
+    baseY += h;
+    inner += depth;
+  }
+  _terraceProfile = p;
+  return p;
+}
+
+// Shelf undulation, exactly periodic over one chunk length: every harmonic is
+// a whole number of cycles across the chunk, so the shelf leaves chunk N at
+// the same height it enters chunk N+1, in any recycle order.
+function shelfWave(t, i) {
+  const a = t * TAU;
+  return Math.sin(a * 2 + i * 1.7) * 0.035 +
+    Math.sin(a * 3 + i * 0.9) * 0.022 +
+    Math.sin(a * 5 + i * 2.4) * 0.014;
+}
+
+// ---------------------------------------------------------------------------
+// Terrace merging.
+//
+// buildTerraces used to emit four meshes PER TIER (wall, coping, fill, shelf).
+// With up to 5 tiers, 3 banks per valley chunk and ~13 chunks live, that alone
+// was roughly 780 draw calls. Every tier in a bank shares the same four
+// materials, so the whole bank collapses to four meshes with no visual change.
+//
+// `bake` pulls a just-created mesh back out of the group and returns its
+// geometry with the mesh transform applied, ready to merge. Safe to dispose
+// the parts afterwards because every geometry fed in here is freshly built
+// (boxGeo, RoundedBoxGeometry and PlaneGeometry all construct, never cache).
+// ---------------------------------------------------------------------------
+const _bank = { wall: [], coping: [], fill: [], top: [] };
+
+function bankReset() {
+  _bank.wall.length = 0;
+  _bank.coping.length = 0;
+  _bank.fill.length = 0;
+  _bank.top.length = 0;
+}
+
+function bake(mesh) {
+  mesh.updateMatrix();
+  const geo = mesh.geometry;
+  geo.applyMatrix4(mesh.matrix);
+  if (mesh.parent) mesh.parent.remove(mesh);
+  return geo;
+}
+
+// One merged mesh per material. Shadow flags match what the individual tiers
+// used to carry, so the shadow pass gets the same reduction.
+function bankEmit(g, mats) {
+  const put = (parts, mat, cast, receive) => {
+    if (!parts.length) return;
+    const m = new THREE.Mesh(parts.length === 1 ? parts[0] : mergeGeoms(parts), mat);
+    m.castShadow = !!cast;
+    m.receiveShadow = !!receive;
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    g.add(m);
+  };
+  put(_bank.wall, mats.ashlar, true, false);
+  put(_bank.coping, mats.dark, false, true);
+  put(_bank.fill, mats.earth, false, false);
+  put(_bank.top, mats.grass, false, true);
+  bankReset();
+}
+
 export function buildTerraces({ side = 1, length = CONFIG.chunkLen, tiers = 4 } = {}) {
   const rnd = nextRnd();
   const g = new THREE.Group();
@@ -633,71 +720,90 @@ export function buildTerraces({ side = 1, length = CONFIG.chunkLen, tiers = 4 } 
   const dark = Mats.stoneDark();
   const earth = Mats.earth();
 
-  let topY = 0;
-  let inner = 4.6; // first wall face, safely outside the run corridor
+  const prof = terraceProfile();
+  const n = Math.min(tiers, prof.length);
   const tierTops = [];
   const fringeMats = [];
+  bankReset();
 
-  for (let i = 0; i < tiers; i++) {
-    const h = 0.95 + rnd() * 0.45;
-    const depth = 2.5 + rnd() * 1.5;
-    const len = Math.max(6, length * (1 - i * 0.045) - rnd() * 2.4);
-    const zOff = (rnd() - 0.5) * 2.2;
-    const wx = inner + (rnd() - 0.5) * 0.24; // per-tier front-line stagger
-    const yaw = (rnd() - 0.5) * 0.024;       // tiny drift breaks the ruler line
+  for (let i = 0; i < n; i++) {
+    const { h, depth, wx, baseY } = prof[i];
 
-    // Retaining wall, sunk below grade, slight inward batter for the classic
-    // stepped Inca silhouette.
+    // Retaining wall, full chunk length and no z offset or yaw: both of those
+    // break the seam. Slight inward batter for the stepped Inca silhouette.
+    // Tier 0 is the only one that meets real fBm terrain (which rolls by up to
+    // +-0.55 m), so it carries a deep skirt; the tiers above only ever meet
+    // the solid fill of the tier below.
+    const skirt = i === 0 ? 4.0 : 0.5;
     const wall = addMesh(
-      g, boxGeo(0.55, h + 0.5, len, ASHLAR_TILE), ashlar,
-      side * (wx + 0.27), topY + (h + 0.5) / 2 - 0.5, zOff
+      g, boxGeo(0.55, h + skirt, length, ASHLAR_TILE), ashlar,
+      side * (wx + 0.27), baseY + (h + skirt) / 2 - skirt, 0
     );
     wall.rotation.z = -side * 0.06;
-    wall.rotation.y = yaw;
     wall.castShadow = true;
+    _bank.wall.push(bake(wall));
 
-    // Darker coping course riding the wall crest, edges softly rounded.
+    // Darker coping course riding the wall crest, edges softly rounded. The
+    // 0.08 overrun lets the rounded ends of neighbouring chunks interpenetrate
+    // instead of leaving a notch, without making any faces coplanar.
     const coping = addMesh(
       g,
-      scaleUV(new RoundedBoxGeometry(0.72, 0.13, len + 0.1, 1, 0.04), (len + 0.1) / STONE_TILE, 0.1),
-      dark, side * (wx + 0.24), topY + h + 0.065, zOff
+      scaleUV(new RoundedBoxGeometry(0.72, 0.13, length + 0.08, 1, 0.04),
+        length / STONE_TILE, 0.1),
+      dark, side * (wx + 0.24), baseY + h + 0.065, 0
     );
-    coping.rotation.y = yaw;
     coping.receiveShadow = true;
+    _bank.coping.push(bake(coping));
 
-    // Grass tier top: gently undulating plane, front edge tucked into the
-    // wall body, back edge under the next tier's wall.
+    // Solid stepped fill. This used to be a 0.22 m soil bed floating over
+    // whatever happened to be below, which left an open void under every shelf
+    // that you could look straight into from the side. Now it is one closed
+    // mass from just under the shelf down to the tier below, or well under
+    // grade on tier 0. Front and back faces are tucked INSIDE the retaining
+    // walls so no two faces ever land coplanar.
+    const fillW = depth + 0.05;
+    const fillTop = baseY + h - 0.045;
+    // Tier 0 reaches well under any terrain the bank can be planted on: the
+    // ground rolls by +-0.55 m of fBm and the banks sit on a slope, so a
+    // shallow foot is a gap under the wall, which reads as a hole.
+    const fillBot = i === 0 ? -3.4 : baseY - 0.5;
+    _bank.fill.push(bake(addMesh(
+      g, boxGeo(fillW, fillTop - fillBot, length, GRASS_TILE), earth,
+      side * (wx + 0.275 + depth / 2), (fillTop + fillBot) / 2, 0
+    )));
+
+    // Grass shelf riding on the fill: front edge tucked into the wall body,
+    // back edge under the next tier's wall, dips settling into the earth.
     const topW = depth + 0.6;
-    const topGeo = new THREE.PlaneGeometry(topW, len, 3, 4);
+    const topGeo = new THREE.PlaneGeometry(topW, length, 3, 12);
     topGeo.rotateX(-Math.PI / 2);
     {
       const p = topGeo.attributes.position;
-      for (let v = 0; v < p.count; v++) p.setY(v, (rnd() * 2 - 1) * 0.06);
+      for (let v = 0; v < p.count; v++) {
+        const t = p.getZ(v) / length + 0.5;  // 0..1 along the chunk
+        const u = p.getX(v) / topW + 0.5;
+        p.setY(v, shelfWave(t, i) + Math.sin(u * 5.1 + i * 2.2) * 0.022);
+      }
       topGeo.computeVertexNormals();
     }
-    scaleUV(topGeo, topW / GRASS_TILE, len / GRASS_TILE);
+    scaleUV(topGeo, topW / GRASS_TILE, length / GRASS_TILE);
     const top = addMesh(
       g, topGeo, grass,
-      side * (wx + 0.3 + depth / 2), topY + h + 0.01, zOff
+      side * (wx + 0.3 + depth / 2), baseY + h + 0.01, 0
     );
     top.receiveShadow = true;
-
-    // Soil bed under the grass: seals tier ends and shows as dark earth in
-    // the undulation dips instead of open sky.
-    addMesh(
-      g, boxGeo(topW - 0.1, 0.22, len - 0.06, GRASS_TILE), earth,
-      side * (wx + 0.3 + depth / 2), topY + h - 0.17, zOff
-    );
+    _bank.top.push(bake(top));
 
     // Grass tufts spilling over the wall lip (gathered into one InstancedMesh).
-    const nF = Math.max(3, Math.floor(len / 1.6));
+    // Scatter only, so per-call randomness is free here.
+    const nF = Math.max(3, Math.floor(length / 1.6));
     for (let k = 0; k < nF; k++) {
       if (rnd() < 0.18) continue;
       const t = (k + 0.5) / nF;
       _dummy.position.set(
         side * (wx + 0.3 + (rnd() - 0.5) * 0.14),
-        topY + h + 0.08,
-        zOff - len / 2 + t * len + (rnd() - 0.5) * 0.9
+        baseY + h + 0.08,
+        -length / 2 + t * length + (rnd() - 0.5) * 0.9
       );
       // rotation.z leans the tuft out over the coping toward the track;
       // small x/y jitter varies the hang without flipping that direction.
@@ -710,14 +816,15 @@ export function buildTerraces({ side = 1, length = CONFIG.chunkLen, tiers = 4 } 
 
     tierTops.push({
       x: side * (wx + 0.6 + depth / 2),
-      y: topY + h,
+      y: baseY + h,
       halfW: depth * 0.3,
-      halfL: len * 0.4,
-      z: zOff,
+      halfL: length * 0.4,
+      z: 0,
     });
-    topY += h;
-    inner += depth;
   }
+
+  // Collapse the whole bank into one mesh per material.
+  bankEmit(g, { ashlar, dark, earth, grass });
 
   if (fringeMats.length) {
     const fim = new THREE.InstancedMesh(fringeTuftGeo(), matFringe(), fringeMats.length);
@@ -1502,6 +1609,129 @@ export function buildQueunaPatch({ count = 5, area = [8, 30] } = {}) {
   return freeze(g);
 }
 
+// ---------------------------------------------------------------------------
+// buildGapVoid: readability dressing for a collapsed road section
+// ---------------------------------------------------------------------------
+// A hazard that kills has to be legible from 40 m at 42 m/s, and the old gap
+// was a dark shaft under a brown road on brown ground: it did not announce
+// itself, and a death you could not see coming is a death that feels stolen.
+// Three cues, in the order the eye picks them up:
+//   VALUE   the throat shades from a sunlit lip to black inside 2 m, so the
+//           hole punches through a road that is now pale stone paving
+//   MOTION  silt drifts up out of the shaft and grit trickles off both lips
+//   EDGE    the lit rim band reads as a broken edge, not a painted line
+// Motion runs entirely on the shared AnimU.time uniform, so there is no update
+// callback and no per-frame allocation. Two draw calls per gap.
+// Purely visual: the caller keeps its collider and isGroundSolid logic.
+
+const GAP_DUST_FRAG = /* glsl */ `
+uniform sampler2D uStreak;
+uniform float uTime;
+varying vec2 vUv;
+varying float vDepth;
+void main() {
+  // Sampling at a falling v scrolls the texture upward through the column.
+  float s1 = texture2D(uStreak, vec2(vUv.x * 0.9, vUv.y * 1.3 - uTime * 0.15)).r;
+  float s2 = texture2D(uStreak, vec2(vUv.x * 1.7 + 0.4, vUv.y * 0.8 - uTime * 0.085)).r;
+  float w = s1 * 0.85 + s2 * 0.6;
+  float ex = smoothstep(0.0, 0.14, vUv.x) * (1.0 - smoothstep(0.86, 1.0, vUv.x));
+  // Dense from inside the throat up to just over the lip, then thinning out.
+  // The band has to reach ABOVE the road line: silt that stops at the rim is
+  // hidden by the road itself at a shallow camera angle, and the whole point
+  // is to break the horizon so the eye catches the hazard early.
+  float ey = smoothstep(0.02, 0.2, vUv.y) * (1.0 - smoothstep(0.72, 1.0, vUv.y));
+  float fade = 1.0 - smoothstep(60.0, 140.0, vDepth);
+  vec3 col = mix(vec3(0.5, 0.45, 0.4), vec3(0.96, 0.9, 0.8), clamp(w, 0.0, 1.0));
+  gl_FragColor = vec4(col, clamp(w, 0.0, 1.0) * 0.5 * ex * ey * fade);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}
+`;
+
+function matGapDust() {
+  return localMat('gapDust', () => new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: AnimU.time,
+      uCurveY: Curve.uniforms.uCurveY,
+      uCurveX: Curve.uniforms.uCurveX,
+      uStreak: { value: streakTex() },
+    },
+    vertexShader: ACCENT_VERT,
+    fragmentShader: GAP_DUST_FRAG,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    fog: false,
+  }));
+}
+
+function matGapThroat() {
+  // Mid stone base color; the vertex ramp is what drives it to black, so the
+  // lip stays a lit broken edge while 2 m down reads as bottomless.
+  return localMat('gapThroat', () =>
+    makeMat({ color: 0x8a8378, roughness: 1, metalness: 0, vertexColors: true })
+  );
+}
+
+export function buildGapVoid({ width = 7.8, length = 3.4 } = {}) {
+  const g = new THREE.Group();
+  const hw = width / 2, hl = length / 2;
+
+  // Throat lining: four inward-facing walls with a lit-to-black ramp.
+  const H = 5.2;
+  const parts = [];
+  const wall = (w, x, z, ry) => {
+    const p = new THREE.PlaneGeometry(w, H, 1, 7);
+    p.translate(0, -H / 2 + 0.04, 0); // top edge just under the road surface
+    p.rotateY(ry);
+    p.translate(x, 0, z);
+    return p;
+  };
+  parts.push(wall(width, 0, -hl, 0));            // far wall, faces +z
+  parts.push(wall(width, 0, hl, Math.PI));       // near wall, faces -z
+  parts.push(wall(length, -hw, 0, Math.PI / 2)); // left wall, faces +x
+  parts.push(wall(length, hw, 0, -Math.PI / 2)); // right wall, faces -x
+  for (const p of parts) {
+    vcolor(p, (x, y, z, c) => {
+      const t = clamp((0.04 - y) / 2.2, 0, 1); // 0 at the lip, 1 at 2.2 m down
+      const v = lerp(1.35, 0.035, smoothstep(0, 1, t));
+      c.setRGB(v, v, v);
+    });
+  }
+  g.add(new THREE.Mesh(mergeGeomsVC(parts), matGapThroat()));
+
+  // Motion. One geometry, one material: two crossed columns of silt rising out
+  // of the shaft, plus a curtain of grit under each lip. The grit planes carry
+  // a flipped v so the same upward-scrolling shader runs them downward.
+  const dust = [];
+  // Column spans y -3.0 .. 1.6, which puts the dense band (v 0.2 to 0.72) at
+  // roughly y -2.1 to 0.3, so the plume is thickest right at the lip and still
+  // visible half a metre over the road.
+  const rise = (w, ry) => {
+    const p = new THREE.PlaneGeometry(w, 4.6, 1, 1);
+    p.translate(0, 4.6 / 2 - 3.0, 0);
+    p.rotateY(ry);
+    return p;
+  };
+  dust.push(rise(width * 0.94, 0));
+  dust.push(rise(length * 1.5, Math.PI / 2));
+  const trickle = (z) => {
+    const p = new THREE.PlaneGeometry(width * 0.9, 2.4, 1, 1);
+    p.translate(0, -1.2 + 0.02, z);
+    const uv = p.attributes.uv;
+    for (let i = 0; i < uv.count; i++) uv.setY(i, 1 - uv.getY(i)); // scroll down
+    return p;
+  };
+  dust.push(trickle(-hl + 0.06));
+  dust.push(trickle(hl - 0.06));
+  const dustMesh = new THREE.Mesh(mergeGeoms(dust), matGapDust());
+  dustMesh.renderOrder = 3;
+  g.add(dustMesh);
+
+  return freeze(g);
+}
+
 // Photogrammetry bush variants standing in for molle trees (assets.js).
 const MOLLE_SHRUBS = ['shrub_a', 'shrub_b', 'shrub_c', 'shrub_d'];
 
@@ -2027,4 +2257,183 @@ export function buildVillageSet() {
   g.add(quipu);
 
   return freeze(g);
+}
+
+// ---------------------------------------------------------------------------
+// Inka farmer working the andenes. Low poly on purpose: he is roadside dressing
+// seen for about a second at 40 m/s, so he is built for silhouette and one
+// readable gesture. Some of them look up and wave as the chasqui passes, most
+// keep working, which is what makes the ones who do greet you feel like people
+// rather than animatronics.
+//
+// API: buildFarmer({ friendly }) -> { group, update(dt), dispose() }
+// Origin at his feet, faces -Z. Zero per-frame allocations.
+// ---------------------------------------------------------------------------
+
+const _farmerV = new THREE.Vector3();
+
+export function buildFarmer({ friendly = false } = {}) {
+  const group = new THREE.Group();
+  const geos = [];
+  const G = (g) => { geos.push(g); return g; };
+  const M = Mats;
+
+  // Tall adults, about 1.9 m to the hat, so they visibly tower over the 1.55 m
+  // Guineo. Just as important: they must not be one brown mass. A figure only
+  // reads as a PERSON at speed if the value steps between head, torso and legs
+  // are strong, so this uses the same language as the hero, a pale unku under
+  // a saturated poncho, rather than a brown block in brown light.
+  const C = CONFIG.colors;
+  const skin = makeMat({ color: C.skinBrown, roughness: 0.82 });
+  const hairMat = makeMat({ color: C.hairBlack, roughness: 0.95 });
+  const unku = makeMat({ color: 0xe8e0cd, roughness: 0.95 });          // pale tunic
+  const legWrap = makeMat({ color: 0x6b5138, roughness: 0.95 });       // dark trousers
+
+  // Legs: dark, so they separate from the pale tunic above them.
+  // Both legs in one mesh: static, same material, never animate separately,
+  // so two draw calls per farmer was pure waste.
+  {
+    const parts = [];
+    for (const sx of [1, -1]) {
+      const lg = new THREE.CapsuleGeometry(0.088, 0.62, 3, 7);
+      lg.translate(sx * 0.12, 0.47, 0);
+      parts.push(lg);
+    }
+    const legs = new THREE.Mesh(mergeGeoms(parts), legWrap);
+    legs.castShadow = true;
+    legs.matrixAutoUpdate = false;
+    legs.updateMatrix();
+    group.add(legs);
+  }
+
+  const torso = new THREE.Group();
+  torso.position.y = 0.86;
+  group.add(torso);
+
+  // Pale tunic: the brightest mass on the figure and the thing you actually
+  // see from the road.
+  const bodyGeo = G(new THREE.CylinderGeometry(0.20, 0.27, 0.62, 9));
+  const body = new THREE.Mesh(bodyGeo, unku);
+  body.position.y = 0.30;
+  body.castShadow = true;
+  torso.add(body);
+
+  // Poncho: a real draped cone over the shoulders, not a box. Open at the
+  // bottom so it silhouettes properly against the terraces.
+  const ponchoGeo = G(new THREE.ConeGeometry(0.30, 0.34, 10, 1, true));
+  const poncho = new THREE.Mesh(
+    ponchoGeo,
+    makeMat({
+      map: Tex.woven(['#b03a2e', '#e8c14d', '#2c3e50', '#d97b29']),
+      roughness: 0.92, side: THREE.DoubleSide,
+    })
+  );
+  poncho.position.y = 0.50;
+  poncho.castShadow = true;
+  torso.add(poncho);
+
+  // Belt and hat band share one woven material on purpose: at road speed the
+  // two palettes were indistinguishable and each farmer paid an extra draw
+  // call for a difference nobody can see.
+  const weave = M.cloth(['#b03a2e', '#e8c14d', '#2c3e50', '#d97b29']);
+  const beltGeo = G(new THREE.TorusGeometry(0.235, 0.036, 5, 12));
+  const belt = new THREE.Mesh(beltGeo, weave);
+  belt.position.y = 0.06;
+  belt.rotation.x = Math.PI / 2;
+  torso.add(belt);
+
+  // Neck keeps the head from sitting straight on the shoulders like a snowman.
+  const neckGeo = G(new THREE.CylinderGeometry(0.055, 0.065, 0.09, 7));
+  const neck = new THREE.Mesh(neckGeo, skin);
+  neck.position.y = 0.66;
+  torso.add(neck);
+
+  const headGeo = G(new THREE.SphereGeometry(0.128, 10, 8));
+  const head = new THREE.Mesh(headGeo, skin);
+  head.position.y = 0.78;
+  head.castShadow = true;
+  torso.add(head);
+
+  // Dark hair under the hat: the value break that makes the head read as a
+  // head instead of a blob on a stick.
+  const hairGeo = G(new THREE.SphereGeometry(0.132, 10, 8));
+  const hair = new THREE.Mesh(hairGeo, hairMat);
+  hair.position.set(0, 0.785, 0.012);
+  hair.scale.set(1, 0.72, 1);
+  head.add(hair);
+  hair.position.set(0, 0.005, 0.01);
+
+  // Montera: wide flat brim, the strongest silhouette read at distance.
+  const brimGeo = G(new THREE.CylinderGeometry(0.26, 0.26, 0.028, 12));
+  const brim = new THREE.Mesh(brimGeo, weave);
+  brim.position.y = 0.875;
+  brim.castShadow = true;
+  torso.add(brim);
+  const crownGeo = G(new THREE.CylinderGeometry(0.10, 0.115, 0.07, 10));
+  const crown = new THREE.Mesh(crownGeo, hairMat);
+  crown.position.y = 0.905;
+  torso.add(crown);
+
+  // Arms: skin toned so they read against the pale tunic.
+  const armGeo = G(new THREE.CapsuleGeometry(0.058, 0.44, 3, 6));
+  const armL = new THREE.Mesh(armGeo, skin);
+  armL.position.set(-0.27, 0.34, 0.02);
+  armL.rotation.z = 0.26;
+  armL.castShadow = true;
+  torso.add(armL);
+
+  const armPivot = new THREE.Group();
+  armPivot.position.set(0.27, 0.56, 0.02);
+  torso.add(armPivot);
+  const armR = new THREE.Mesh(armGeo, skin);
+  armR.position.y = -0.24;
+  armR.castShadow = true;
+  armPivot.add(armR);
+
+  // Chakitaqlla, the Andean foot plough, planted in the soil beside him.
+  const toolGeo = G(new THREE.CylinderGeometry(0.026, 0.026, 1.52, 6));
+  const tool = new THREE.Mesh(toolGeo, makeMat({ color: C.woodBrown, roughness: 0.9 }));
+  tool.position.set(-0.46, 0.74, 0.08);
+  tool.rotation.z = 0.26;
+  tool.castShadow = true;
+  group.add(tool);
+
+  const S = {
+    t: Math.random() * 10,
+    waveT: -1,
+    done: false,
+    phase: Math.random() * TAU,
+  };
+
+  function update(dt) {
+    if (!(dt > 0)) return;
+    dt = Math.min(dt, 0.05);
+    S.t += dt;
+
+    // Working bend: slow, heavy, slightly irregular.
+    const work = Math.sin(S.t * 1.5 + S.phase);
+    torso.rotation.x = 0.46 + work * 0.2;
+
+    if (friendly && !S.done) {
+      // He notices the runner from his own world position, so the greeting
+      // lands as the chasqui actually draws level rather than on a timer.
+      group.getWorldPosition(_farmerV);
+      if (S.waveT < 0 && _farmerV.z > -32 && _farmerV.z < -4) S.waveT = 0;
+    }
+
+    if (S.waveT >= 0) {
+      S.waveT += dt;
+      const p = Math.min(S.waveT / 1.7, 1);
+      // Straighten up out of the bend, raise the arm, wave, back to work.
+      const rise = Math.sin(Math.min(p, 0.5) * Math.PI);
+      torso.rotation.x = lerp(0.46 + work * 0.2, 0.03, rise);
+      armPivot.rotation.z = -2.5 * rise;
+      armPivot.rotation.x = Math.sin(S.waveT * 14) * 0.38 * rise;
+      head.rotation.y = 0.45 * rise;
+      if (p >= 1) { S.waveT = -1; S.done = true; armPivot.rotation.set(0, 0, 0); head.rotation.y = 0; }
+    }
+  }
+
+  function dispose() { for (const g of geos) g.dispose(); }
+  return { group, update, dispose };
 }

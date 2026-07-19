@@ -7,6 +7,14 @@
   <title>Chasqui Run</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect x='35' y='10' width='30' height='15' fill='%23e9b44c'/%3E%3Crect x='20' y='25' width='60' height='15' fill='%23e9b44c'/%3E%3Crect x='10' y='40' width='80' height='20' fill='%23e9b44c'/%3E%3Crect x='20' y='60' width='60' height='15' fill='%23e9b44c'/%3E%3Crect x='35' y='75' width='30' height='15' fill='%23e9b44c'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="css/style.css" />
+  <!-- PWA: installable, fullscreen, landscape, playable offline. -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Chasqui Run" />
+  <meta name="description" content="Corre el Qhapaq Nan como chasqui del Inca. Lleva el quipu y entrega el encargo cueste lo que cueste." />
   <script type="importmap">
     {
       "imports": {
@@ -27,5 +35,15 @@
     </div>
   </div>
   <script type="module" src="src/main.js"></script>
+  <script>
+    // Registered after load so it never competes with the game's own boot
+    // fetches for bandwidth on a phone. Failure is silent and harmless: the
+    // game runs identically without it, just without offline support.
+    if ('serviceWorker' in navigator) {
+      addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () {});
+      });
+    }
+  </script>
 </body>
 </html>

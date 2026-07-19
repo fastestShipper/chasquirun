@@ -1,5 +1,5 @@
 // The chasqui: star of the game. Fully procedural build + animation.
-// API (ARCHITECTURE.md): buildChasqui() -> { group, update(dt, state), setMode(mode), onFootstep(cb), dispose() }
+// API (ARCHITECTURE.md): buildChasqui() -> { group, update(dt, state), setMode(mode), onFootstep(cb), setIntiGlow(t01), setQipiVisible(v), dispose() }
 // state: { mode: 'idle'|'run'|'jump'|'slide'|'fall'|'menu', speed01, airT, leanX, dead }
 // Group origin at feet, character faces -Z. Zero allocations inside update().
 //
@@ -23,30 +23,96 @@ import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { CONFIG } from './config.js';
 import { clamp, damp, lerp, smoothstep, TAU } from './util.js';
-import { makeMat, Mats, Tex } from './materials.js';
+import { applyCurvature, makeMat, Tex } from './materials.js';
+
+// ---------------------------------------------------------------------------
+// Rim light. Guineo's skin sat at almost the same LIGHTNESS as the compacted
+// earth road, so from the gameplay camera his silhouette dissolved into the
+// surface he runs on, which is fatal in a runner. A warm fresnel edge picks
+// him out against earth, stone, grass and snow alike without touching his
+// albedo, and reads as hard high-altitude sun rather than as an outline.
+//
+// It chains ONTO the material's existing onBeforeCompile instead of replacing
+// it, so the shared curved-world vertex bend from materials.js still runs.
+// Injected before <dithering_fragment>, i.e. after tone mapping and the
+// colorspace conversion, so the strength is in display space and cannot blow
+// through the bloom threshold the way a pre-tonemap add would.
+// ---------------------------------------------------------------------------
+const RIM_CHUNK = `
+{
+  float rimF = 1.0 - clamp( dot( normalize( normal ), normalize( vViewPosition ) ), 0.0, 1.0 );
+  rimF = pow( rimF, uRimPower );
+  gl_FragColor.rgb += uRimColor * ( rimF * uRimStrength );
+}
+`;
+
+// Every rim material shares one program: the patch source is identical and the
+// tuning values are per-material uniforms, so this is a single extra compile.
+function rimPatch(shader) {
+  shader.uniforms.uRimColor = { value: new THREE.Color(0xffd9a0) };
+  shader.uniforms.uRimStrength = { value: 0.22 };
+  shader.uniforms.uRimPower = { value: 2.6 };
+  shader.fragmentShader = shader.fragmentShader
+    .replace(
+      '#include <common>',
+      '#include <common>\nuniform vec3 uRimColor;\nuniform float uRimStrength;\nuniform float uRimPower;'
+    )
+    .replace('#include <dithering_fragment>', RIM_CHUNK + '\n#include <dithering_fragment>');
+}
+
+function applyRim(mat) {
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = function (shader, renderer) {
+    if (prev) prev.call(this, shader, renderer);
+    rimPatch(shader);
+  };
+  // Distinct from the curvature-only key so rimmed and plain materials do not
+  // collide in the program cache.
+  mat.customProgramCacheKey = () => 'chasquiRim';
+  return mat;
+}
 
 const HALF_PI = Math.PI / 2;
 const HIP_Y = 0.62;
+// Eyelid cap rotation. The cap poles at +Y, so a more negative rotation.x tips
+// it forward over the pupil. The old rest value (-0.35) was already a heavy
+// hood that buried the iris; open is now barely a hood at all.
+// Measured in the canted eye pivot's own frame, so it carries the pivot's
+// -0.27 x cant: 0.72 here lands as a lid that just kisses the top of the iris.
+const LID_OPEN = 0.72;
+const LID_SHUT = -1.30;
 
 let sharedMats = null;
 function getMats() {
   if (sharedMats) return sharedMats;
   const C = CONFIG.colors;
+  // CONFIG.colors.skinBrown (0xa8744a) sits within ~20 points of luminance of
+  // CONFIG.colors.pathTan, the compacted-earth road, so from behind at speed
+  // Guineo's arms and legs merged into the surface. Deepened a step: value is
+  // what separates a silhouette, and going DARKER separates him further from
+  // the road than going lighter would, while staying a natural warm brown.
+  const SKIN = 0x96603a;
   sharedMats = {
-    skin: makeMat({ color: C.skinBrown, roughness: 0.72 }),
+    skin: makeMat({ color: SKIN, roughness: 0.72 }),
     // Dedicated instance for the SkinnedMesh so the skinned shader program
     // never has to share a material with rigid meshes.
-    skinBody: makeMat({ color: C.skinBrown, roughness: 0.72 }),
+    skinBody: makeMat({ color: SKIN, roughness: 0.72 }),
     hair: makeMat({ color: C.hairBlack, roughness: 0.95 }),
     eyeWhite: makeMat({ color: 0xffffff, roughness: 0.25 }),
-    iris: makeMat({ color: 0x38230f, roughness: 0.3 }),
+    // Warm dark brown rather than near black: at this size the iris is a large
+    // shape, and a true void reads as a hole punched in his face.
+    iris: makeMat({ color: 0x46301c, roughness: 0.35 }),
     glint: makeMat({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9 }),
-    lid: makeMat({ color: C.skinBrown, roughness: 0.8, side: THREE.DoubleSide }),
+    lid: makeMat({ color: SKIN, roughness: 0.8, side: THREE.DoubleSide }),
     cheek: makeMat({ color: 0xc9705a, roughness: 1 }),
     mouth: makeMat({ color: 0x3a231a, roughness: 0.8 }),
-    tunic: makeMat({ color: C.tunicWhite, roughness: 0.95 }),
+    // Warmed a step off CONFIG.tunicWhite: the token value reads cold grey
+    // against the blue sky fill, which is most of why the unku looked like
+    // cardboard. Detail comes from the woven hem and cuff bands instead of a
+    // map: Tex.woven over a near-tone cream just produces corrugated stripes.
+    tunic: makeMat({ color: 0xe6d8bb, roughness: 0.95 }),
     // Open tunic cloth sheets (unku skirt, sleeves) are seen from both sides.
-    tunicCloth: makeMat({ color: C.tunicWhite, roughness: 0.95, side: THREE.DoubleSide }),
+    tunicCloth: makeMat({ color: 0xe6d8bb, roughness: 0.95, side: THREE.DoubleSide }),
     shorts: makeMat({ color: C.accentNavy, roughness: 0.95 }),
     // Open cloth sheets are seen from both sides.
     poncho: makeMat({ color: C.ponchoRed, roughness: 0.9, side: THREE.DoubleSide }),
@@ -54,14 +120,39 @@ function getMats() {
       map: Tex.woven(['#d97b29', '#e8c14d', '#2c3e50', '#b03a2e']),
       roughness: 0.92, side: THREE.DoubleSide,
     }),
-    trim: Mats.cloth(['#d97b29', '#e8c14d', '#2c3e50', '#b03a2e']),
+    // Private instances rather than the shared Mats.cloth singletons: these
+    // carry Guineo's rim patch, and rimming a cached material would put the
+    // edge light on every other prop that happens to ask for the same weave.
+    trim: makeMat({
+      map: Tex.woven(['#d97b29', '#e8c14d', '#2c3e50', '#b03a2e']), roughness: 0.92,
+    }),
     chullo: makeMat({ color: 0x8c2f24, roughness: 0.95 }),
-    band: Mats.cloth(['#e8c14d', '#b03a2e', '#2c3e50', '#d97b29']),
+    band: makeMat({
+      map: Tex.woven(['#e8c14d', '#b03a2e', '#2c3e50', '#d97b29']), roughness: 0.92,
+    }),
     pomRed: makeMat({ color: 0xd6493c, roughness: 1 }),
     pomYellow: makeMat({ color: C.accentYellow, roughness: 1 }),
     sandal: makeMat({ color: C.woodBrown, roughness: 0.95 }),
     conch: makeMat({ color: 0xe8d7bd, roughness: 0.55 }),
+    // Contact shadow. He already casts a real shadow, but at the gameplay
+    // camera it is soft and offset, so nothing pins him to the road. This adds
+    // the dark band directly under the feet that anchors him. Unlit on
+    // purpose, and it still takes the world bend so it stays glued to a
+    // curving road.
+    contact: applyCurvature(new THREE.MeshBasicMaterial({
+      map: Tex.softCircle('#000000'),
+      transparent: true, opacity: 0.34, depthWrite: false,
+    })),
   };
+  // Skin, cloth and gear take the rim. The eye parts and the mouth interior
+  // are deliberately left out: an edge light on a 5 cm sphere just frosts the
+  // eye and undoes the soft dark iris.
+  const RIMMED = [
+    'skin', 'skinBody', 'hair', 'lid', 'cheek', 'tunic', 'tunicCloth',
+    'shorts', 'poncho', 'ponchoTrim', 'trim', 'chullo', 'band',
+    'pomRed', 'pomYellow', 'sandal', 'conch',
+  ];
+  for (const k of RIMMED) applyRim(sharedMats[k]);
   return sharedMats;
 }
 
@@ -313,7 +404,8 @@ export function buildChasqui() {
   // Sandal: flat rounded sole, soft foot dome, toe strap arc, and a tall
   // ojota strap cuff that dresses the skinned ankle. Foot pivot world y =
   // 0.12; sole bottom rests at y ~0.007 (never below 0).
-  const soleGeo = G(new RoundedBoxGeometry(0.105, 0.03, 0.19, 2, 0.012));
+  // segments 1: same silhouette on a 3 cm-thick sole, a third of the verts.
+  const soleGeo = G(new RoundedBoxGeometry(0.105, 0.03, 0.19, 1, 0.012));
   const domeGeo = G(new THREE.SphereGeometry(0.054, 12, 9));
   const strapGeo = G(new THREE.TorusGeometry(0.048, 0.009, 5, 10, Math.PI));
   const cuffGeo = G(new THREE.CylinderGeometry(0.068, 0.075, 0.085, 10));
@@ -360,11 +452,18 @@ export function buildChasqui() {
   // real unku); update() rides them on the thighs so the hem never eats the
   // legs at full stride. Hem rests at world y ~0.455 (knee tops at ~0.44).
   const skirtGeo = G(makeFlapGeo(0.173, 0.21, 0, -0.28, 2.5, 0.04, 0.05));
+  // Woven hem band riding the same wave field, so the unku ends in a real
+  // selvedge instead of a raw cut edge. Without it the skirt is the biggest
+  // untextured mass on the character and reads as a paper cone.
+  const skirtTrimGeo = G(makeFlapGeo(0.202, 0.212, -0.196, -0.262, 2.5, 0.04, 0.05, 0, 0.28));
   const skirtF = addPivot(torso, 0, 0.115, -0.12);
   const skirtFront = addMesh(skirtF, skirtGeo, MT.tunicCloth, 0, 0, 0.12);
   skirtFront.rotation.y = Math.PI;
+  const skirtTrimFront = addMesh(skirtF, skirtTrimGeo, MT.ponchoTrim, 0, 0, 0.12);
+  skirtTrimFront.rotation.y = Math.PI;
   const skirtB = addPivot(torso, 0, 0.115, 0.12);
   addMesh(skirtB, skirtGeo, MT.tunicCloth, 0, 0, -0.12);
+  addMesh(skirtB, skirtTrimGeo, MT.ponchoTrim, 0, 0, -0.12);
 
   // Poncho flaps: curved cloth sheets with wavy rounded hems + woven trim.
   const SWEEP = 2.1;
@@ -410,11 +509,15 @@ export function buildChasqui() {
   conch.rotation.set(0.4, 0, -1.2);
 
   // ---- Sleeves + shoulder fill (rigid cloth riding the upper arm bones) ---
-  const shoulderGeo = G(new THREE.SphereGeometry(0.063, 10, 8));
-  const sleeveGeo = G(new THREE.CylinderGeometry(0.074, 0.096, 0.29, 10, 1, true));
-  sleeveGeo.translate(0, -0.09, 0);
-  const sleeveTrimGeo = G(new THREE.CylinderGeometry(0.0965, 0.1005, 0.034, 10, 1, true));
-  sleeveTrimGeo.translate(0, -0.218, 0);
+  // The old sleeve flared from r 0.074 to r 0.096 over 0.29 m while the arm
+  // beneath it is only r ~0.05, so it hung off the limb as an open-ended
+  // cardboard bell. It is now a short unku sleeve that tapers back IN toward
+  // the arm and closes on a woven cuff, so it reads as worn cloth.
+  const shoulderGeo = G(new THREE.SphereGeometry(0.066, 10, 8));
+  const sleeveGeo = G(new THREE.CylinderGeometry(0.076, 0.066, 0.20, 10, 1, true));
+  sleeveGeo.translate(0, -0.075, 0);
+  const sleeveTrimGeo = G(new THREE.CylinderGeometry(0.0675, 0.0705, 0.032, 10, 1, true));
+  sleeveTrimGeo.translate(0, -0.166, 0);
   addMesh(armL, shoulderGeo, MT.tunic);
   addMesh(armR, shoulderGeo, MT.tunic);
   addMesh(armL, sleeveGeo, MT.tunicCloth);
@@ -422,72 +525,138 @@ export function buildChasqui() {
   addMesh(armL, sleeveTrimGeo, MT.ponchoTrim);
   addMesh(armR, sleeveTrimGeo, MT.ponchoTrim);
 
+  // Hands. The skinned arm tube already carries a hand bulge, but on its own
+  // it reads as a rounded stump at any distance. A flattened palm plus a
+  // thumb gives the silhouette an actual terminus, which is what sells the
+  // arm swing during the run and the wave on the title screen. Parented to
+  // the elbow bone so they follow the forearm.
+  // A scaled sphere, not a RoundedBoxGeometry: at segments 2 that primitive
+  // costs 900 verts, which is absurd for a part the size of a coin, and a
+  // soft mitten reads better on a stylized kid than a box anyway. The scale
+  // reproduces the same 62 x 78 x 46 mm envelope for 80 verts.
+  const palmGeo = G(new THREE.SphereGeometry(0.036, 9, 7));
+  const thumbGeo = G(new THREE.CapsuleGeometry(0.014, 0.022, 2, 6));
+  for (const s of [1, -1]) {
+    const e = s > 0 ? elbowL : elbowR;
+    const palm = addMesh(e, palmGeo, MT.skin, 0, -0.232, -0.004);
+    palm.scale.set(0.86, 1.08, 0.64);
+    palm.rotation.set(0.10, 0, s * 0.12);
+    const thumb = addMesh(e, thumbGeo, MT.skin, s * 0.034, -0.212, -0.020);
+    thumb.rotation.set(0.35, 0, s * 0.55);
+  }
+
   // ---- Head and face ------------------------------------------------------
   const skull = addMesh(head, G(new THREE.SphereGeometry(0.20, 20, 16)), MT.skin, 0, 0.02, 0);
   skull.scale.set(1, 0.96, 0.99);
-  // Soft jaw: squashed lower sphere merged into the skull.
-  const jawSoft = addMesh(head, G(new THREE.SphereGeometry(0.15, 16, 12)), MT.skin, 0, -0.075, -0.015);
-  jawSoft.scale.set(0.9, 0.78, 0.95);
-  // Hair: ring peeking under the hat band + front fringe.
-  const hairRing = addMesh(head, G(new THREE.SphereGeometry(0.206, 16, 10)), MT.hair, 0, 0.085, 0);
-  hairRing.scale.set(1, 0.55, 1);
-  const fringe = addMesh(head, G(new THREE.SphereGeometry(0.10, 12, 8)), MT.hair, 0, 0.065, -0.15);
-  fringe.scale.set(1.5, 0.4, 0.8);
+  // Soft jaw: squashed lower sphere merged into the skull. Pulled down and in
+  // so it never swallows the lower half of the eyeballs.
+  const jawSoft = addMesh(head, G(new THREE.SphereGeometry(0.15, 16, 12)), MT.skin, 0, -0.092, -0.018);
+  jawSoft.scale.set(0.88, 0.74, 0.92);
+  // Hair: a narrow band peeking under the hat, plus a fringe that stops at the
+  // BROW line. The old ring reached y = -0.028 and the old fringe y = 0.025,
+  // i.e. both hung across the eyes and merged into one black bar that read as
+  // a blindfold. Everything above the brows now, nothing across the eyes.
+  const hairRing = addMesh(head, G(new THREE.SphereGeometry(0.206, 16, 10)), MT.hair, 0, 0.098, 0);
+  hairRing.scale.set(1, 0.33, 1);
+  const fringe = addMesh(head, G(new THREE.SphereGeometry(0.10, 12, 8)), MT.hair, 0, 0.095, -0.150);
+  fringe.scale.set(1.42, 0.20, 0.74);
 
-  const eyeGeo = G(new THREE.SphereGeometry(0.056, 14, 10));
-  const irisGeo = G(new THREE.SphereGeometry(0.029, 10, 8));
-  const glintGeo = G(new THREE.SphereGeometry(0.011, 6, 5));
-  const lidGeo = G(new THREE.SphereGeometry(0.062, 12, 7, 0, TAU, 0, Math.PI * 0.56));
+  // Eyes. The eyeball centre used to sit 0.176 from the skull centre inside a
+  // 0.20 skull, so only 29% of the ball cleared the face and the lid hood ate
+  // most of what was left: two dark slots. Pushed forward and enlarged so a
+  // real white-and-iris eye reads at gameplay distance.
+  // Eyes. A small pupil floating in a big white ball is the universal read of
+  // shock, and a ball that protrudes past the face reads as stuck on rather
+  // than set in: together they made him look alarmed and monstrous. Inverted
+  // to the appealing-stylized ratio instead (Alto's Odyssey, A Short Hike):
+  // a LARGE soft-dark iris filling almost the whole aperture, only a thin rim
+  // of sclera at the edges, and the ball seated deep enough in the skull that
+  // the side silhouette stays a clean cheek line.
+  const EYE_R = 0.048;
+  const eyeGeo = G(new THREE.SphereGeometry(EYE_R, 14, 10));
+  // The iris is a CAP concentric with the eyeball, not a sphere poked through
+  // it, so it lies flush on the surface at any size. thetaLength 1.05 rad puts
+  // the iris edge at ~60 degrees off the eye axis, slightly WIDER than the
+  // ~56 degree aperture the skull cuts, so the iris fills the opening and the
+  // sclera survives only as a thin rim at the very corners.
+  const irisGeo = G(new THREE.SphereGeometry(EYE_R * 1.012, 14, 9, 0, TAU, 0, 1.05));
+  irisGeo.rotateX(-HALF_PI);
+  const glintGeo = G(new THREE.SphereGeometry(0.0095, 6, 5));
+  const lidGeo = G(new THREE.SphereGeometry(EYE_R * 1.05, 12, 7, 0, TAU, 0, Math.PI * 0.54));
   const eyes = [];
   const lids = [];
   for (const sx of [1, -1]) {
-    const eye = addPivot(head, sx * 0.078, 0.03, -0.155);
+    const eye = addPivot(head, sx * 0.068, -0.020, -0.150);
+    // The ball sits deep in the skull, so the aperture the face actually cuts
+    // is centred on the OUTWARD radial direction, not on straight ahead. The
+    // pivot is canted onto that axis so the iris cap fills the opening evenly
+    // instead of leaving a sclera crescent down one side, and the lid (a child
+    // of this pivot) follows the same axis.
+    eye.rotation.set(-0.27, -sx * 0.41, 0);
     addMesh(eye, eyeGeo, MT.eyeWhite);
-    addMesh(eye, irisGeo, MT.iris, 0, -0.002, -0.038);
-    addMesh(eye, glintGeo, MT.glint, sx * 0.013, 0.015, -0.055);
+    addMesh(eye, irisGeo, MT.iris);
+    addMesh(eye, glintGeo, MT.glint, sx * 0.006, 0.021, -0.042);
     const lid = addPivot(eye, 0, 0, 0);
     addMesh(lid, lidGeo, MT.lid);
-    lid.rotation.x = -0.35;
+    lid.rotation.x = LID_OPEN;
     eyes.push(eye);
     lids.push(lid);
   }
 
-  const brows = addPivot(head, 0, 0.112, -0.155);
-  const browGeo = G(new RoundedBoxGeometry(0.08, 0.022, 0.024, 2, 0.009));
-  const browL = addMesh(brows, browGeo, MT.hair, 0.078, 0, -0.036);
-  browL.rotation.set(0, 0.28, -0.13);
-  const browR = addMesh(brows, browGeo, MT.hair, -0.078, 0, -0.036);
-  browR.rotation.set(0, -0.28, 0.13);
+  // Softer brows: thinner, flatter and less angled than the heavy wedges that
+  // were adding to the alarmed read. Warm and friendly with a hint of resolve.
+  const brows = addPivot(head, 0, 0.052, -0.155);
+  // segments 1, not 2: on a 2 cm bar the corner subdivision is invisible and
+  // segments 2 costs 900 verts per brow.
+  const browGeo = G(new RoundedBoxGeometry(0.074, 0.018, 0.022, 1, 0.008));
+  const browL = addMesh(brows, browGeo, MT.hair, 0.069, 0, -0.038);
+  browL.rotation.set(0, 0.26, -0.08);
+  const browR = addMesh(brows, browGeo, MT.hair, -0.069, 0, -0.038);
+  browR.rotation.set(0, -0.26, 0.08);
 
   // Tiny rounded button nose: soft cone + sphere tip.
-  const nose = addMesh(head, G(new THREE.ConeGeometry(0.02, 0.045, 10)), MT.skin, 0, -0.018, -0.205);
+  const nose = addMesh(head, G(new THREE.ConeGeometry(0.020, 0.044, 10)), MT.skin, 0, -0.072, -0.198);
   nose.rotation.x = -HALF_PI;
-  addMesh(head, G(new THREE.SphereGeometry(0.013, 8, 6)), MT.skin, 0, -0.018, -0.226);
+  addMesh(head, G(new THREE.SphereGeometry(0.0135, 8, 6)), MT.skin, 0, -0.072, -0.219);
 
-  const smile = addMesh(head, G(new THREE.TorusGeometry(0.052, 0.0085, 5, 10, 1.9)), MT.mouth, 0, -0.062, -0.185);
+  const smile = addMesh(head, G(new THREE.TorusGeometry(0.048, 0.0085, 5, 10, 1.9)), MT.mouth, 0, -0.112, -0.174);
   smile.rotation.set(-0.22, 0, -HALF_PI - 0.95);
-  const cheekGeo = G(new THREE.SphereGeometry(0.032, 8, 6));
-  const cheekL = addMesh(head, cheekGeo, MT.cheek, 0.122, -0.045, -0.148);
-  cheekL.scale.set(1, 0.72, 0.42);
+  const cheekGeo = G(new THREE.SphereGeometry(0.030, 8, 6));
+  const cheekL = addMesh(head, cheekGeo, MT.cheek, 0.128, -0.090, -0.132);
+  cheekL.scale.set(1, 0.70, 0.40);
   cheekL.rotation.y = -0.6;
-  const cheekR = addMesh(head, cheekGeo, MT.cheek, -0.122, -0.045, -0.148);
-  cheekR.scale.set(1, 0.72, 0.42);
+  const cheekR = addMesh(head, cheekGeo, MT.cheek, -0.128, -0.090, -0.132);
+  cheekR.scale.set(1, 0.70, 0.40);
   cheekR.rotation.y = 0.6;
 
   // ---- Chullo hat: sphere-slice cap, knitted band, teardrop ear flaps -----
-  addMesh(head, G(new THREE.SphereGeometry(0.222, 16, 10, 0, TAU, 0, Math.PI * 0.55)), MT.chullo, 0, 0.125, 0);
-  addMesh(head, G(new THREE.CylinderGeometry(0.226, 0.23, 0.09, 16, 1, true)), MT.band, 0, 0.12, 0);
+  // Raised so the band clears the fringe instead of sitting on the brows.
+  addMesh(head, G(new THREE.SphereGeometry(0.222, 16, 10, 0, TAU, 0, Math.PI * 0.55)), MT.chullo, 0, 0.142, 0);
+  addMesh(head, G(new THREE.CylinderGeometry(0.226, 0.232, 0.095, 16, 1, true)), MT.band, 0, 0.148, 0);
   const earflapGeo = G(new THREE.SphereGeometry(0.08, 9, 8));
   earflapGeo.scale(0.55, 1.3, 0.36);
   earflapGeo.translate(0, -0.085, 0);
   for (const sx of [1, -1]) {
-    const flap = addPivot(head, sx * 0.198, 0.09, -0.015);
+    const flap = addPivot(head, sx * 0.198, 0.108, -0.015);
     flap.rotation.z = sx * 0.3;
     addMesh(flap, earflapGeo, MT.band);
     addMesh(flap, G(new THREE.SphereGeometry(0.033, 8, 6)), MT.pomYellow, 0, -0.185, 0);
   }
   const pompom = addPivot(head, 0, 0.345, 0);
   addMesh(pompom, G(new THREE.SphereGeometry(0.056, 10, 8)), MT.pomRed, 0, 0.035, 0);
+
+  // ---- Contact shadow ------------------------------------------------------
+  // Parented to `group` so it follows lane changes and inherits the land
+  // squash (which reads as the blob spreading on impact). Hidden during the
+  // death tumble, when `group` spins and a ground-locked decal would spin
+  // with it.
+  const contactGeo = G(new THREE.PlaneGeometry(0.66, 0.66));
+  const contact = new THREE.Mesh(contactGeo, MT.contact);
+  contact.rotation.x = -HALF_PI;
+  contact.position.y = 0.012;
+  contact.renderOrder = -1;
+  contact.castShadow = false;
+  group.add(contact);
 
   // ---- Animation state (all scalars, zero per-frame allocation) -----------
   const S = {
@@ -639,6 +808,10 @@ export function buildChasqui() {
       eyeT += wF * 0.33;
     }
     group.rotation.x = -S.tumbleA * wF;
+    // Ground decal: fades out as he leaves the ground and is dropped entirely
+    // once the tumble starts rotating the group it is parented to.
+    contact.visible = wF < 0.5;
+    MT.contact.opacity = 0.34 * (1 - clamp(airT * 1.5, 0, 0.8)) * (1 - wS * 0.35);
 
     // ---- IDLE / MENU (breathing, look-around, friendly wave) ----------------
     if (wI > 0.003) {
@@ -726,7 +899,7 @@ export function buildChasqui() {
     }
     let close = S.blinkT >= 0 ? Math.sin((S.blinkT / 0.12) * Math.PI) : 0;
     if (wF > 0.4) close = 0; // eyes locked wide open during a fall
-    const lidRot = lerp(-0.35, -1.5, close);
+    const lidRot = lerp(LID_OPEN, LID_SHUT, close);
     lids[0].rotation.x = lidRot;
     lids[1].rotation.x = lidRot;
 
@@ -752,8 +925,62 @@ export function buildChasqui() {
 
   function dispose() {
     for (const g of geos) g.dispose();
+    intiLight.dispose();
     skeleton.dispose();
   }
 
-  return { group, update, setMode, onFootstep, dispose };
+  // ---- Rayo de Inti: the sun god lights Guineo from within ----------------
+  // Every body material ramps a warm gold emissive with the boost. The eye
+  // materials stay out of it so the face keeps its own highlights instead of
+  // blowing out into a featureless glowing blob. Emissive is a uniform, so
+  // this never triggers a shader recompile.
+  // Each material glows in its OWN color pushed toward gold, never in flat
+  // gold: a uniform emissive turns Guineo into a featureless gold statue and
+  // throws away the red chullo, the poncho and the woven trim that make him
+  // readable. This way he radiates while still looking like himself.
+  const GLOW = new THREE.Color(0xffb03c);
+  const glowMats = [
+    MT.skin, MT.skinBody, MT.hair, MT.lid, MT.cheek, MT.tunic, MT.tunicCloth,
+    MT.shorts, MT.poncho, MT.ponchoTrim, MT.trim, MT.chullo, MT.band,
+    MT.pomRed, MT.pomYellow, MT.sandal, MT.conch,
+  ];
+  for (const m of glowMats) {
+    m.emissive.copy(m.color).lerp(GLOW, 0.35);
+    m.emissiveIntensity = 0;
+  }
+  let glowT = 0;
+
+  // Emissive alone only reads as an overexposed character. The blessing sells
+  // itself when he becomes a real light source and throws gold onto the road
+  // and the props beside him. Built once at intensity 0 and never added or
+  // removed, so animating it never triggers a shader recompile. No shadows:
+  // this is a fill light, and a second shadow map is not worth the cost.
+  // Height is tightly constrained: below ~1.7 it sits inside his own hat and
+  // leaves black patches on the surfaces facing away from it, above ~2.6 it
+  // ends up inside gateway lintels and tunnel ceilings and speckles those
+  // instead. 2.2 clears his head and stays under anything he can run through.
+  const intiLight = new THREE.PointLight(0xffb14a, 0, 22, 2);
+  intiLight.position.set(0, 2.2, 0.2);
+  intiLight.castShadow = false;
+  group.add(intiLight);
+
+  function setIntiGlow(t01) {
+    const t = t01 < 0 ? 0 : t01 > 1 ? 1 : t01;
+    if (t === glowT) return;
+    glowT = t;
+    // Enough to push the bright cloth over the bloom threshold so he throws
+    // light, low enough that albedo still reads.
+    const e = t * 0.42;
+    for (let i = 0; i < glowMats.length; i++) glowMats[i].emissiveIntensity = e;
+    // Kept deliberately low. Push this much past ~10 and the surfaces nearest
+    // the light overdrive the bloom pass and break up into black speckles, the
+    // same artifact the hot emissive coins already show.
+    intiLight.intensity = t * 6;
+  }
+
+  // The encomienda. A chasqui exists to deliver it, so it is the one thing
+  // worth stealing, and the one thing he can visibly lose.
+  function setQipiVisible(v) { qipi.visible = !!v; }
+
+  return { group, update, setMode, onFootstep, setIntiGlow, setQipiVisible, dispose };
 }

@@ -2,8 +2,11 @@
 
 Endless runner (Temple Run style, modernized lane-based) set in the Inca world.
 Final product quality: menus, HUD, save data, full procedural Andean music, SFX,
-photoreal-leaning stylized visuals. 100% self-contained: NO network requests at
-runtime, NO external assets, NO CDN. Everything is generated procedurally
+photoreal-leaning stylized visuals. NO CDN and no third-party runtime services:
+everything ships from our own origin. The game DOES fetch vendored assets at
+boot (PolyHaven photo PBR sets in assets/tex/, glTF models in assets/models/,
+recorded SFX in assets/sfx/), each behind a graceful fallback so a missing file
+degrades instead of breaking. Everything else is generated procedurally
 (canvas textures, WebAudio synthesis, primitive-built models).
 
 ## Hard rules for every module author
@@ -22,7 +25,10 @@ runtime, NO external assets, NO CDN. Everything is generated procedurally
 6. No `fetch`, no `XMLHttpRequest`, no external URLs, no Google Fonts.
 7. Dispose discipline: every module that creates geometries/textures/materials
    at runtime (not shared cached ones) must provide `dispose()` or reuse pools.
-8. Performance budget: total draw calls under ~350. Merge static geometry per
+8. Performance budget: the stated target is ~350 draw calls, but a measured
+   frame in July 2026 was 1326-1574 calls at 1.0-1.17M triangles, so the game
+   is far over it and the number needs either enforcing or revising. Treat this
+   as a known debt, not as a budget that is being met. Merge static geometry per
    prop where reasonable (`BufferGeometryUtils` is NOT vendored, so merge by
    building single BufferGeometries or use `InstancedMesh` for repeated bits;
    groups of a few meshes per prop are fine). Canvas textures max 1024px.
@@ -198,6 +204,72 @@ puff, idle chew + neck sway. Sitting variant used as an obstacle. Alpaca:
 rounder, fluffier, shorter neck. Condor: 3 m wingspan, white neck ruff,
 finger-feather tips, slow majestic flap. Keep each under ~30 meshes.
 
+#### Killa, the nemesis llama (animals.js)
+
+A smug diva who trolls the player. Unlike the decorative camelids she is a
+fully rigged character with locomotion and an authored pose-track system.
+Origin at ground under the body center, faces -Z, 2.17 m to the ear tips.
+
+```js
+export function buildKilla() -> {
+  group,                   // THREE.Group
+  update(dt),              // locomotion + idle + any playing pose track
+  setGait(kind, speed01),  // 'idle'|'walk'|'trot'|'gallop'; speed01 0..1 scales cycle rate
+  setLook(yaw, pitch),     // radians, aim head/neck at the player, additive over idle
+  setEars(mode),           // 'up'|'flat'|'mock' (mock = one up, one back)
+  playPose(name),          // fire a one-shot pose track, returns duration in seconds
+  poseTime(name),          // duration in seconds without playing it
+  isPosing(),              // bool
+  setAttitude(v),          // 0..1 smug->angry: idle chew speed, ear default, head height
+  dispose(),
+  // beyond the contract, for SFX/VFX hookup:
+  poseSnapTime(name),      // seconds from pose start to its 'snap' event (0 if none)
+  onPoseEvent(cb),         // cb(poseName, eventName) fired during update
+  stopPose(),              // release a holding pose (trophy, kush)
+}
+```
+
+Poses (`playPose` names), authored as keyframe tracks, NOT sine wiggles.
+Each has anticipation, a snap, a hold and a settle, and plays ADDITIVELY over
+locomotion so she can trot and taunt at once. Real durations:
+
+| name | dur | beat |
+|---|---|---|
+| `look` | 0.50 | head snaps to camera, ears pin back, holds. The core telegraph. |
+| `smirk` | 0.70 | head tilt + slow blink + one ear cocked |
+| `spit` | 0.90 | 600 ms neck coil back, then a 250 ms snap forward; `snap` event at 0.85 |
+| `chuckle` | 1.10 | four head bobs, each smaller, body shaking, turning away |
+| `stamp` | 0.50 | front hoof paws the ground twice; `stamp` events at 0.16 and 0.37 |
+| `kick` | 0.60 | rump turns to track, back legs kick; `kick` event at 0.34 |
+| `tantrum` | 2.80 | 0.4 s offense, 1.2 s ugly gallop, then an INSTANT drop to a smooth walk while she looks off at the mountains. The comedy is the timing of the giving-up; the step is a `hold` keyframe at 1.6 s. Do not smooth it. |
+| `applaud` | 3.20 | three claps EXACTLY 0.9 s apart (0.4, 1.3, 2.2), eyes half-lidded and dead. Stops mid-motion on the third and leaves without lowering her hooves. The wide spacing feels wrong to implement and correct to watch. Do not "fix" it. |
+| `trophy` | hold | hoof planted forward, chest out, neck vertical, chin at max elevation, chewing. Loops idle sway for the death screen; ends only on `stopPose`. |
+| `kush` | hold | lies down, chin flat on ground, eyes closed, for the pause screen. |
+
+Events fired through `onPoseEvent`: `snap`, `stamp`, `kick`, `offense`,
+`giveup`, `clap`, `walkoff`.
+
+Rig joints (internal, exposed by `buildCamelid({rig: true})` as `joints`):
+`root, body, bodyMesh, neck, neckSegs[4], head, jaw, ears[2], lids[2],
+legs[4], knees[4], tail`. Leg order is fixed: 0 FL, 1 FR, 2 BL, 3 BR.
+The neck is a 4-segment chain that ARCS rather than hinges, so she can do the
+180 degree over-the-shoulder look (anatomically true for llamas, and her
+signature beat). Gaits use proper diagonal pairing for the trot (FL+BR,
+FR+BL) and a 4-beat bounding gallop, with body bob, neck counter-sway and a
+lagged tail counterweight.
+
+Visual identity, deliberately distinct from the decorative llama: rounder and
+taller, fringed blanket with two gold-tone discs on the flanks, hard-angled
+4-sided ears at ~1.4x length, a box jaw, and a geometric upper eyelid cap
+sitting a third of the way down the eyeball, rotated forward at the outer
+corner with the pupil offset outward so she permanently side-eyes. Three flat
+lash quads per eye, merged into one mesh.
+
+Budget: 35 meshes, 9 materials, and only the body and legs (12 meshes) cast
+shadows, since she is permanently close to camera. `addMesh` takes a trailing
+`cast` argument defaulting to true so the decorative animals are unaffected.
+Zero per-frame allocations in `update()`.
+
 ### SCENERY (src/scenery.js)
 
 Static prop builders, all using Mats/Tex, all cheap, curvature comes free via
@@ -321,6 +393,59 @@ Pause: "Pausa", buttons "Reanudar", "Reiniciar", "Menú".
 Toasts for biomes: "Valle Sagrado", "La Ciudadela", "La Puna", "El Gran Puente".
 
 ---
+
+### NEMESIS (src/nemesis.js)
+
+Killa, the llama nemesis. A persistent character who trolls the player, not an
+obstacle that spawns. `new Nemesis(scene, killa, hooks)`.
+
+Two rules that are not negotiable:
+
+1. **She is parented to the SCENE, never to `worldGroup`.** She lives in player
+   space beside the chasqui; her `z` is an offset from the player, who sits at
+   z ~ 0 while the world scrolls underneath. Parenting her to `worldGroup`
+   would fight chunk recycling and push toward mutating `worldGroup`, which is
+   forbidden. The curved-world bend is a per-material view-space vertex effect,
+   not a parent transform, so she bends correctly regardless.
+
+2. **She never goes through `track.getColliders()`.** That pool is a fixed 96
+   entries and silently `break`s when full, so pushing her in would drop real
+   obstacle colliders and make actual obstacles pass-through. She owns her own
+   soft-collider test against the player box.
+
+Fairness contract, all enforced in code:
+
+- She randomizes BEFORE the tell and is deterministic AFTER it. Once locked,
+  her collider lane is frozen while she stays free to animate chaotically on
+  top. The trolling is a perception layer; the collision is deterministic.
+- The tell is measured in TIME (0.9 s, 1.2 s near a gap), not distance, so the
+  reaction budget is constant across the whole speed ramp.
+- She may only become solid from a position the player can still answer. If she
+  did not get far enough ahead during the tell she downgrades to a taunt.
+- Her lane plus static colliders may never cover all three lanes; when the
+  check fails an OBSTACLE is dropped, never the llama.
+- **She can never kill the player.** Her body is a permanent soft collider: a
+  headbutt costs lane, combo, coins and tempo, never a life. She does take
+  credit for kills she did not commit, while `causeLine()` still names the real
+  cause honestly.
+- She is absent before 420 m, and periodically leaves entirely for 320 to 700 m
+  so her return stays an event.
+
+`buildKilla()` (animals.js) supplies the rig: `setGait/setLook/setEars/
+setAttitude/playPose/poseTime/poseSnapTime/isPosing/stopPose/onPoseEvent/
+setCarry`. Poses are pose-tracks, not sine wiggles, because comic timing needs
+anticipation, a hold, a snap and a settle.
+
+Hooks keep this module free of direct audio/UI/particle dependencies:
+`spit, chuckle, taunt, orgle, stamp, panic, sting, splatter, toast, portrait,
+armed, steal(n), siphon(), headbutt(dir), stealQipi(), returnQipi(caught)`.
+
+The encomienda: the chasqui exists to deliver it, so it is the real stake. She
+can take it (`I.ROBO`), which flips the game into a chase, freezes coin banking
+until it is recovered, and is always returned eventually.
+
+Debug: `window.__cq.nemesis.setDebug(true)` draws her collider and the lock
+line. Build a fair-looking change without it and you are guessing.
 
 ## Integration notes (core side, FYI)
 
