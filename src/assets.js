@@ -27,6 +27,26 @@ import { applyCurvature } from './materials.js';
 // of `footprint` (max horizontal extent, meters) or `height` (meters) sets
 // the canonical size. `sink` buries the base by that fraction of the height.
 const FILES = [
+  // Blender-authored Inca masonry kit (tools/kit_masonry.py). The stones are
+  // real geometry rather than a texture on a flat face, which is the only way
+  // per-stone silhouette and joint depth survive at close range. Each piece is
+  // pre-merged to a single mesh so it costs one draw call.
+  {
+    url: 'assets/kit/portada.glb',
+    templates: { kit_portada: { height: 5.4 } },
+  },
+  {
+    url: 'assets/kit/wall_9m.glb',
+    templates: { kit_wall_9m: {} },
+  },
+  {
+    url: 'assets/kit/wall_4m5.glb',
+    templates: { kit_wall_4m5: {} },
+  },
+  {
+    url: 'assets/kit/wall_low_9m.glb',
+    templates: { kit_wall_low_9m: {} },
+  },
   {
     url: 'assets/models/moon_rock_02/moon_rock_02_1k.gltf',
     templates: { rock_a: { footprint: 1.24, sink: 0.06 } },

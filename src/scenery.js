@@ -911,6 +911,24 @@ export function buildStoneWall({ length = 8, height = 2.2 } = {}) {
 // y 3.9, which leaves 3.57 of half-clearance at y 3.2.
 
 export function buildGateway() {
+  // Blender-authored masonry first: the stones are real geometry, so the
+  // per-stone silhouette and joint depth hold up when the player runs
+  // straight through it. Falls back to the procedural trapezoid build if the
+  // kit file is missing or failed to load, so the game never loses a gateway.
+  const kit = cloneModel('kit_portada');
+  if (kit) {
+    const kg = new THREE.Group();
+    kit.traverse((o) => {
+      if (o.isMesh) {
+        o.material = Mats.stone();
+        o.castShadow = true;
+        o.receiveShadow = true;
+      }
+    });
+    kg.add(kit);
+    return freeze(kg);
+  }
+
   const g = new THREE.Group();
   const stone = Mats.stone();
   const dark = Mats.stoneDark();
