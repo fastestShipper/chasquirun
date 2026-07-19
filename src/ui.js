@@ -257,7 +257,7 @@ export class UI {
       '<i class="sub-rule"></i>' +
       '</div>' +
       '<p class="lore t-anim d3">Llevas el quipu del Inca por el Qhapaq' +
-      NARROW_SPACE + 'Ñan. Entregalo cueste lo que cueste.</p>' +
+      NARROW_SPACE + 'Ñan. Entrégalo cueste lo que cueste.</p>' +
       '<div class="chips t-anim d3">' +
       '<div class="chip">' + mountainSVG('chip-ico') +
       '<span class="chip-txt"><span class="chip-label">Mejor marca</span>' +
