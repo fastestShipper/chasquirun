@@ -104,20 +104,28 @@ const TAUNTS = [
   '¿Seguro que no son papas?',
   'Huele a choclo. No me mientas.',
   'Comparte, pues. Un bocadito.',
-  'Yo se que ahi hay comida.',
+  'Yo sé que ahí hay comida.',
   'Solo quiero oler. Un poquito.',
-  'Corre, corre. El bulto igual es mio.',
+  'Corre, corre. El bulto igual es mío.',
   '¿Y si me das la mitad?',
+  '¿Es mote? Dime que es mote.',
+  'Ese bulto suena a cancha.',
+  'Yo no muerdo. Casi nunca.',
+  'Dos pasos más y te lo reviso.',
+  'Tanto peso para ti solo. Qué egoísta.',
 ];
 const ROASTS = [
-  'Descansa. Yo te cuido el bulto.',
-  'Se te cayo el encargo. Que pena.',
+  'Se te cayó el encargo. Qué pena.',
   'Corriste bonito. Corto, pero bonito.',
-  'Ahora si puedo revisar con calma.',
+  'Ahora sí puedo revisar con calma.',
   'Vuelve cuando te crezcan las piernas.',
-  'Yo camino mas rapido que eso. Y camino.',
+  'Yo camino más rápido que eso. Y camino.',
   'Tu chullo era lo mejor de ti.',
   '¿Ves? Debiste compartir.',
+  'Tanto correr para terminar echado.',
+  'Te ganó el camino. Yo solo miraba.',
+  'El Inca va a preguntar. Yo no vi nada.',
+  'Descansa. El bulto y yo te esperamos.',
 ];
 // When she went home with your things, she thanks you for them.
 // She got the bundle and it was, of course, knotted cord. She is still
@@ -125,8 +133,10 @@ const ROASTS = [
 const ROASTS_ROBBED = [
   'Gracias por la chicha.',
   'No eran papas. Igual me lo quedo.',
-  'Puros nudos. Que decepcion.',
+  'Puros nudos. Qué decepción.',
   'Dile al Inca que su encargo sabe feo.',
+  'Cargabas hilo. Todo este escándalo por hilo.',
+  'Lo mastiqué. Sabe a cuerda mojada.',
 ];
 // A record does not make her gracious, it makes her furious. Flat delivery,
 // one syllable of enthusiasm, which is funnier than an insult.
@@ -509,7 +519,7 @@ export class Nemesis {
     this.k.playPose('smirk');
     this.k.setEars('mock');
     this.k.setGait('walk', 0.4);
-    if (this.h.toast) this.h.toast('Me aburri. Sigue corriendo.');
+    if (this.h.toast) this.h.toast('Me aburrí. Sigue corriendo.');
     this.targetX = this._rnd() < 0.5 ? -9.5 : 9.5;
     this.targetZ = 16;
   }
@@ -559,12 +569,12 @@ export class Nemesis {
     if (t > 2.9 && t < 3.0) {
       // The question that starts the whole feud. She is not threatening him,
       // she is nosy and hungry and has decided the bundle is lunch.
-      if (this.h.toast) this.h.toast('¿Que llevas ahi? ¿Papas?');
+      if (this.h.toast) this.h.toast('¿Qué llevas ahí? ¿Papas?');
     }
     if (t > 3.9 && t < 4.0) {
       this.k.playPose('chuckle');
       if (this.h.chuckle) this.h.chuckle();
-      if (this.h.toast) this.h.toast('Yo se que es comida. Lo huelo.');
+      if (this.h.toast) this.h.toast('Yo sé que es comida. Lo huelo.');
     }
     if (t > 5.4) {
       this.debutDone = true;
@@ -580,7 +590,7 @@ export class Nemesis {
     this.k.setEars('up');
     this.addKarma(0.4);
     if (this.h.panic) this.h.panic();
-    if (this.h.toast) this.h.toast('¡Casi! Se me escapo el almuerzo.');
+    if (this.h.toast) this.h.toast('¡Casi! Se me escapó el almuerzo.');
     if (this.h.dodged) this.h.dodged();
     this.targetZ = 5;
     this.lockedLane = -1;
@@ -601,7 +611,7 @@ export class Nemesis {
     } else {
       this.addKarma(0.5);
       if (this.h.panic) this.h.panic();
-      if (this.h.toast) this.h.toast('¡Ya! Ni sabia rico igual.');
+      if (this.h.toast) this.h.toast('¡Ya! Ni sabía rico igual.');
     }
     this._endIntervention({ dist: this.lastDist });
     return true;
@@ -663,9 +673,9 @@ export class Nemesis {
   // to do with), which is funnier and also proves she was innocent.
   causeLine(cause) {
     const mine = this.sinceCommit < 2.5;
-    if (cause === 'fall') return mine ? 'Killa te dejo sin piso.' : 'Caiste al abismo.';
-    if (cause === 'hit') return mine ? 'Killa te empujo al muro.' : 'Chocaste con el camino.';
-    return mine ? 'Killa te barrio.' : 'Fin del camino.';
+    if (cause === 'fall') return mine ? 'Killa te dejó sin piso.' : 'Caíste al abismo.';
+    if (cause === 'hit') return mine ? 'Killa te empujó al muro.' : 'Chocaste con el camino.';
+    return mine ? 'Killa te barrió.' : 'Fin del camino.';
   }
 
   // ---- Death staging -------------------------------------------------------
@@ -746,7 +756,7 @@ export class Nemesis {
       this.k.playPose('chuckle');
       if (this.h.stealQipi) this.h.stealQipi();
       if (this.h.chuckle) this.h.chuckle();
-      if (this.h.toast) this.h.toast('¡Mio! ... ¿Nudos? ¿Puros nudos?');
+      if (this.h.toast) this.h.toast('¡Mío! ... ¿Nudos? ¿Puros nudos?');
       return true;
     }
     // Shove them out of her lane, toward whichever side has room.

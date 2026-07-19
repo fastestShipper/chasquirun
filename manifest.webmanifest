@@ -1,7 +1,7 @@
 {
   "name": "Chasqui Run",
   "short_name": "Chasqui",
-  "description": "Corre el Qhapaq Nan como chasqui del Inca. Lleva el quipu, esquiva a Killa y entrega el encargo cueste lo que cueste.",
+  "description": "Corre el Qhapaq Ñan como chasqui del Inca. Lleva el quipu, esquiva a Killa y entrega el encargo cueste lo que cueste.",
   "id": "/chasquirun/",
   "start_url": "./",
   "scope": "./",

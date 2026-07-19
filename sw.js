@@ -14,7 +14,7 @@
 //
 // Bump CACHE_VERSION on every deploy: it is what evicts the old build.
 
-const CACHE_VERSION = 'chasqui-20260719-0514';
+const CACHE_VERSION = 'chasqui-20260719-0745';
 
 // The shell needed to boot and reach the title screen. Everything else is
 // picked up lazily as the game requests it, so a failed precache of some

@@ -448,7 +448,7 @@ async function boot() {
       G.pututuArmed = on;
       // The mountain tells you what you can do. She only ever tells you what
       // you failed to do.
-      if (on) ui.apuToast('El pututu ha despertado. Invocalo con Shift.');
+      if (on) ui.apuToast('El pututu ha despertado. Invócalo con Shift.');
     },
     // She robs the run, never the life. Coins, combo, tempo and charge are
     // hers to take; survival is not.
@@ -512,7 +512,7 @@ async function boot() {
   const TIPS_TOUCH = [
     'Desliza izquierda o derecha para cambiar de carril',
     'Desliza arriba para saltar, abajo para deslizarte',
-    'Toca el boton RAYO para invocar al sol',
+    'Toca el botón RAYO para invocar al sol',
     'Recoge soles sin romper la racha',
   ];
   const TIPS_KEYS = [
@@ -528,8 +528,8 @@ async function boot() {
     'Killa quiere tu encomienda, no tus soles',
     'Cuando te mire fijo, va a atacar un carril',
     isMobile
-      ? 'Lee el carril y deslizate a otro: fallara'
-      : 'Lee el carril y cambiate a otro: fallara',
+      ? 'Lee el carril y deslízate a otro: fallará'
+      : 'Lee el carril y cámbiate a otro: fallará',
   ];
   const killaTips = [0, 4.5, 9].map((after, i) => ({ after, said: false, text: killaTipText[i] }));
   let killaSeen = false;
@@ -549,7 +549,7 @@ async function boot() {
     { at: 60, said: false, line: isMobile
       ? 'Pide ayuda al sol cuando necesites correr.'
       : 'Pide ayuda al sol cuando necesites correr. Shift.' },
-    { at: 1500, said: false, line: 'El camino se estrecha. Manten el paso, chasqui.' },
+    { at: 1500, said: false, line: 'El camino se estrecha. Mantén el paso, chasqui.' },
   ];
   function resetApuBeats() { for (const b of apuBeats) b.said = false; }
 

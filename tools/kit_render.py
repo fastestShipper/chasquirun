@@ -55,9 +55,11 @@ def main(glb, png):
     cam_data = bpy.data.cameras.new("cam")
     cam = bpy.data.objects.new("cam", cam_data)
     bpy.context.collection.objects.link(cam)
-    # Three-quarter view: shows the face AND the depth of the joints, which a
-    # straight-on shot hides.
-    cam.location = (ctr[0] + size * 1.15, ctr[1] + size * 0.55, ctr[2] + size * 1.35)
+    # Mostly frontal, slightly off-axis and near eye height. This is roughly
+    # how the player meets a gateway, and it is the angle that judges the FACE.
+    # A high three-quarter shot mostly shows the top of the wall, which is not
+    # the surface anyone looks at in game.
+    cam.location = (ctr[0] + size * 0.42, ctr[1] - size * 1.05, ctr[2] + size * 0.22)
     look_at(cam, ctr)
     bpy.context.scene.camera = cam
 
